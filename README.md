@@ -67,6 +67,8 @@ Choose a refresh interval in the toolbar from **0.5 to 5.0 seconds**, in **0.5-s
 
 Charts cover the last **60 real seconds**, independent of the chosen refresh rate. Collection and history updates continue while the window is minimized. History starts empty and fills as the application collects measurements; it is not loaded from before launch. CPU utilization and throughput need two valid readings, so their first sample has no rate. Missing readings and counter resets create gaps instead of zero-valued activity.
 
+Chart inspection keeps the selected observation as new samples arrive. When that observation expires, selection moves to the oldest remaining point.
+
 **Pause** freezes collection and the displayed history. **Resume** starts a fresh history and primes rate counters again. Closing the application discards history.
 
 Open **Settings & accessibility** to change interface size from **100% to 200%**, in 25% steps. Refresh interval and interface scale are saved automatically to:
@@ -122,13 +124,17 @@ Read/write and incoming/outgoing rates are counter deltas divided by the actual 
 
 Disk counters come from `/proc/diskstats`. Sectors are always converted using 512 bytes, regardless of the device's physical sector size. Discovery through `/sys/block` excludes partitions, loop devices, RAM disks, zram, and stacked devices with slaves. This measures the underlying whole devices without summing a partition or LVM/RAID layer again. It is disk I/O throughput, not filesystem space usage. See the kernel's [block statistics](https://docs.kernel.org/block/stat.html) and [I/O statistics fields](https://docs.kernel.org/admin-guide/iostats.html).
 
+Disk generations from `/sys/block/<device>/diskseq` distinguish replacement drives that reuse a device name. Identity is checked before and after reading counters; a replacement needs a fresh rate baseline. If the kernel or sysfs view does not expose a valid disk generation, lifetime counters remain visible, rates are unavailable, and a notice explains why.
+
 Network counters come from `/proc/net/dev`; loopback is excluded. Interface indices identify replacement links even when they reuse a previous name; a replacement starts with a fresh rate baseline. If an interface's identity cannot be read, its lifetime counters remain visible while rates are unavailable. “All interfaces” sums interface traffic, including virtual interfaces. A bridge, VPN, or virtual adapter can observe traffic also counted on another interface, so that sum is not necessarily unique external traffic. Select a specific interface when you need its rate. “Up” primarily reflects the interface's administrative `IFF_UP` flag and does not guarantee Internet connectivity.
 
 A selected disk or network interface stays selected across pause/resume and missing readings. Its selector shows “unavailable” until it returns; choose “All devices” or “All interfaces” to switch back to combined traffic.
 
 ### Temperatures and unavailable data
 
-Temperatures come from `/sys/class/hwmon`, with thermal-zone readings used to fill gaps. Driver labels identify channels, and critical limits appear only when reported. Faulted sensor readings are omitted with an availability notice. PECI control targets (Tcontrol, Tthrottle, and Tjmax) are excluded from measured temperatures. The CPU headline is the hottest sensor recognized as belonging to the CPU; recognition depends on driver and channel names. Known duplicate thermal-zone/hwmon readings are skipped, while independent sensors with equal temperatures are retained. See the [hwmon interface](https://docs.kernel.org/hwmon/sysfs-interface.html) and [PECI channel definitions](https://docs.kernel.org/hwmon/peci-cputemp.html#sysfs-interface).
+Temperatures come from `/sys/class/hwmon`, with thermal-zone readings used to fill gaps. Driver labels identify channels, and critical limits appear only when reported. Faulted sensor readings are omitted with an availability notice. PECI control targets (Tcontrol, Tthrottle, and Tjmax) are excluded from measured temperatures. The CPU headline is the hottest sensor recognized as belonging to the CPU; recognition depends on driver and channel names. Readable inputs resolving to the same sysfs file are deduplicated. Other readings are retained when their shared identity cannot be proved, so similar driver names or equal temperatures cannot hide an available package sensor. See the [hwmon interface](https://docs.kernel.org/hwmon/sysfs-interface.html) and [PECI channel definitions](https://docs.kernel.org/hwmon/peci-cputemp.html#sysfs-interface).
+
+VT1211 external channels require board-specific conversion and are omitted with a notice; its calibrated internal diode remains available. Loadpeek does not apply `sensors.conf` conversion formulas. See the [VT1211 temperature definitions](https://docs.kernel.org/hwmon/vt1211.html#temperature-monitoring).
 
 For AMD sensors exposing both Tdie and Tctl, the CPU headline prefers the physical Tdie reading over the same device's offset fan-control Tctl value. CCD and other CPU temperatures still contribute to the hottest reading. Tctl remains visible under its driver label and is used as a fallback when that device has no valid Tdie reading. See the [k10temp temperature definitions](https://docs.kernel.org/hwmon/k10temp.html). Legacy hwmon layouts also retain their driver names when attributes are exposed under `device/`.
 

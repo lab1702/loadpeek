@@ -149,6 +149,12 @@ struct Counters {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct DiskBaseline {
+    diskseq: u64,
+    counters: Counters,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct NetworkBaseline {
     ifindex: u32,
     counters: Counters,
@@ -159,7 +165,7 @@ pub struct Collector {
     proc_root: PathBuf,
     sys_root: PathBuf,
     previous_cpu: BTreeMap<String, CpuTimes>,
-    previous_disks: BTreeMap<String, Counters>,
+    previous_disks: BTreeMap<String, DiskBaseline>,
     previous_networks: BTreeMap<String, NetworkBaseline>,
     previous_disk_time: Option<Instant>,
     previous_network_time: Option<Instant>,
@@ -308,6 +314,19 @@ impl Collector {
     }
 
     fn sample_disks(&mut self, warnings: &mut Vec<String>) -> Vec<Disk> {
+        // Device names can be reused between samples. Check generations on
+        // both sides of diskstats so replacement during this read cannot seed
+        // a new device's baseline with the previous device's counters.
+        let identities_before: BTreeMap<_, _> = fs::read_dir(self.sys_root.join("block"))
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                Some((name, disk_sequence(&entry.path())?))
+            })
+            .collect();
         let Some(text) = read_required(&self.proc_root.join("diskstats"), warnings) else {
             self.previous_disks.clear();
             self.previous_disk_time = None;
@@ -326,10 +345,30 @@ impl Collector {
             .into_iter()
             .filter(|(name, _)| devices.contains(name))
             .collect();
+        let mut next_baselines = BTreeMap::new();
+        let mut unknown_identities = 0;
         let disks = counters
             .iter()
             .map(|(name, current)| {
-                let previous = self.previous_disks.get(name);
+                let diskseq = disk_sequence(&self.sys_root.join("block").join(name))
+                    .filter(|sequence| identities_before.get(name) == Some(sequence));
+                let previous = diskseq.and_then(|sequence| {
+                    self.previous_disks
+                        .get(name)
+                        .filter(|previous| previous.diskseq == sequence)
+                        .map(|previous| &previous.counters)
+                });
+                if let Some(diskseq) = diskseq {
+                    next_baselines.insert(
+                        name.clone(),
+                        DiskBaseline {
+                            diskseq,
+                            counters: *current,
+                        },
+                    );
+                } else {
+                    unknown_identities += 1;
+                }
                 Disk {
                     name: name.clone(),
                     read_bytes_per_sec: previous
@@ -345,7 +384,12 @@ impl Collector {
         if disks.is_empty() {
             warnings.push("No readable whole-disk I/O counters were found.".into());
         }
-        self.previous_disks = counters;
+        if unknown_identities > 0 {
+            warnings.push(format!(
+                "{unknown_identities} disk identity reading(s) were unavailable or changed during collection; their rates are unavailable."
+            ));
+        }
+        self.previous_disks = next_baselines;
         self.previous_disk_time = Some(now);
         disks
     }
@@ -430,6 +474,13 @@ impl Collector {
         self.previous_network_time = Some(now);
         networks
     }
+}
+
+fn disk_sequence(device: &Path) -> Option<u64> {
+    read_trimmed(device.join("diskseq"))?
+        .parse()
+        .ok()
+        .filter(|sequence| *sequence > 0)
 }
 
 fn network_ifindex(interface: &Path) -> Option<u32> {
@@ -706,9 +757,11 @@ fn read_temperature(path: &Path) -> Option<f64> {
 
 fn discover_sensors(sys_root: &Path, warnings: &mut Vec<String>) -> Vec<Sensor> {
     let mut sensors = Vec::new();
-    let mut sources = BTreeSet::new();
-    let mut hwmon_drivers = BTreeSet::new();
+    let mut hwmon_sources = BTreeSet::new();
+    let mut available_sources = BTreeSet::new();
+    let mut rejected_sources = BTreeSet::new();
     let mut inaccessible = 0;
+    let mut unconverted_vt1211 = 0;
     if let Ok(entries) = fs::read_dir(sys_root.join("class/hwmon")) {
         for entry in entries.flatten() {
             let root = entry.path();
@@ -734,19 +787,29 @@ fn discover_sensors(sys_root: &Path, warnings: &mut Vec<String>) -> Vec<Sensor> 
                     }) else {
                         continue;
                     };
+                    let path = attribute.path();
+                    let canonical = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                    if rejected_sources.contains(&canonical) {
+                        continue;
+                    }
                     // PECI channels 3–5 expose Tcontrol, Tthrottle, and Tjmax
                     // targets through _input files, rather than measurements.
                     if is_peci_cpu && matches!(channel, "temp3" | "temp4" | "temp5") {
-                        continue;
-                    }
-                    let path = attribute.path();
-                    let canonical = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-                    if !sources.insert(canonical.clone()) {
+                        rejected_sources.insert(canonical);
                         continue;
                     }
                     if read_trimmed(directory.join(format!("{channel}_enable"))).as_deref()
                         == Some("0")
                     {
+                        rejected_sources.insert(canonical);
+                        continue;
+                    }
+                    // Only the internal diode (temp2) is calibrated by vt1211.
+                    // Its other channels require board-specific conversion;
+                    // temp3-temp7 even expose millivolts rather than millidegrees.
+                    if driver == "vt1211" && channel != "temp2" {
+                        unconverted_vt1211 += 1;
+                        rejected_sources.insert(canonical);
                         continue;
                     }
                     // A plausible input value is still invalid when the driver
@@ -755,6 +818,10 @@ fn discover_sensors(sys_root: &Path, warnings: &mut Vec<String>) -> Vec<Sensor> 
                         == Some("1")
                     {
                         inaccessible += 1;
+                        rejected_sources.insert(canonical);
+                        continue;
+                    }
+                    if !hwmon_sources.insert(canonical.clone()) {
                         continue;
                     }
                     let Some(celsius) = read_temperature(&path) else {
@@ -784,13 +851,17 @@ fn discover_sensors(sys_root: &Path, warnings: &mut Vec<String>) -> Vec<Sensor> 
                         critical_celsius,
                         cpu_temperature_source,
                     });
-                    hwmon_drivers.insert(driver.to_ascii_lowercase());
+                    available_sources.insert(canonical);
                 }
             }
         }
     }
-    // Thermal zones fill gaps where hwmon does not expose the same driver.
-    // Do not deduplicate based on equal temperatures: independent sensors can agree.
+    // An explicit fault, disabled state, unsupported unit, or control target
+    // invalidates every alias, even if another hwmon view was read first.
+    sensors.retain(|sensor| !rejected_sources.contains(Path::new(&sensor.id)));
+    // A driver name or matching temperature cannot identify an individual sensor.
+    // Skip known aliases of accepted or rejected inputs, but retain independent
+    // zones, including x86 package readings with unknown coretemp association.
     if let Ok(entries) = fs::read_dir(sys_root.join("class/thermal")) {
         for entry in entries.flatten() {
             if !entry
@@ -803,16 +874,9 @@ fn discover_sensors(sys_root: &Path, warnings: &mut Vec<String>) -> Vec<Sensor> 
             let directory = entry.path();
             let label = read_trimmed(directory.join("type"))
                 .unwrap_or_else(|| entry.file_name().to_string_lossy().into_owned());
-            if hwmon_drivers.contains(&label.to_ascii_lowercase()) {
-                continue;
-            }
-            // x86_pkg_temp and coretemp package channels read the same Intel sensor.
-            if label == "x86_pkg_temp" && hwmon_drivers.contains("coretemp") {
-                continue;
-            }
             let path = directory.join("temp");
             let canonical = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-            if !sources.insert(canonical.clone()) {
+            if available_sources.contains(&canonical) || rejected_sources.contains(&canonical) {
                 continue;
             }
             let Some(celsius) = read_temperature(&path) else {
@@ -843,6 +907,7 @@ fn discover_sensors(sys_root: &Path, warnings: &mut Vec<String>) -> Vec<Sensor> 
                 critical_celsius,
                 cpu_temperature_source: CpuTemperatureSource::Other,
             });
+            available_sources.insert(canonical);
         }
     }
     sensors.sort_by(|left, right| {
@@ -857,6 +922,11 @@ fn discover_sensors(sys_root: &Path, warnings: &mut Vec<String>) -> Vec<Sensor> 
     } else if inaccessible > 0 {
         warnings.push(format!(
             "{inaccessible} temperature reading(s) were unavailable or invalid."
+        ));
+    }
+    if unconverted_vt1211 > 0 {
+        warnings.push(format!(
+            "{unconverted_vt1211} VT1211 external sensor channel(s) require board-specific conversion and are omitted."
         ));
     }
     sensors
@@ -1107,6 +1177,132 @@ mod tests {
     }
 
     #[test]
+    fn replacing_a_disk_requires_a_new_baseline() {
+        let fixture = Fixture::new();
+        fixture.write("sys/block/sda/diskseq", "10");
+        fixture.write("proc/diskstats", "8 0 sda 1 0 20 0 2 0 30 0 0 0 0");
+        let mut collector = Collector::with_roots(fixture.0.join("proc"), fixture.0.join("sys"));
+        let mut warnings = Vec::new();
+        assert!(
+            collector.sample_disks(&mut warnings)[0]
+                .read_bytes_per_sec
+                .is_none()
+        );
+        let steady = collector.sample_disks(&mut warnings);
+        assert_eq!(steady[0].read_bytes_per_sec, Some(0.0));
+        assert_eq!(steady[0].write_bytes_per_sec, Some(0.0));
+
+        // A newly attached disk can already have larger counters by the next
+        // sample, so a decreasing-counter check cannot identify replacement.
+        fixture.write("sys/block/sda/diskseq", "11");
+        fixture.write("proc/diskstats", "8 0 sda 1 0 1000 0 2 0 2000 0 0 0 0");
+        let replacement = collector.sample_disks(&mut warnings);
+        assert_eq!(replacement[0].total_read_bytes, 512_000);
+        assert_eq!(replacement[0].total_write_bytes, 1_024_000);
+        assert_eq!(replacement[0].read_bytes_per_sec, None);
+        assert_eq!(replacement[0].write_bytes_per_sec, None);
+        assert_eq!(
+            collector.sample_disks(&mut warnings)[0].read_bytes_per_sec,
+            Some(0.0)
+        );
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn unavailable_disk_identity_preserves_totals_and_reprimes_rates() {
+        let fixture = Fixture::new();
+        let identity = "sys/block/sda/diskseq";
+        fixture.write(identity, "10");
+        fixture.write("proc/diskstats", "8 0 sda 1 0 20 0 2 0 30 0 0 0 0");
+        let mut collector = Collector::with_roots(fixture.0.join("proc"), fixture.0.join("sys"));
+        let mut warnings = Vec::new();
+        collector.sample_disks(&mut warnings);
+        assert_eq!(
+            collector.sample_disks(&mut warnings)[0].read_bytes_per_sec,
+            Some(0.0)
+        );
+        for invalid in [None, Some(""), Some("invalid"), Some("0"), Some("-1")] {
+            if let Some(value) = invalid {
+                fixture.write(identity, value);
+            } else {
+                fs::remove_file(fixture.0.join(identity)).unwrap();
+            }
+            warnings.clear();
+            let sample = collector.sample_disks(&mut warnings);
+            assert_eq!(sample[0].total_read_bytes, 20 * 512);
+            assert_eq!(sample[0].total_write_bytes, 30 * 512);
+            assert_eq!(sample[0].read_bytes_per_sec, None);
+            assert_eq!(sample[0].write_bytes_per_sec, None);
+            assert!(
+                warnings
+                    .iter()
+                    .any(|warning| warning.contains("disk identity"))
+            );
+            fixture.write(identity, "10");
+            warnings.clear();
+            let recovered = collector.sample_disks(&mut warnings);
+            assert_eq!(recovered[0].read_bytes_per_sec, None);
+            assert_eq!(recovered[0].write_bytes_per_sec, None);
+            assert_eq!(
+                collector.sample_disks(&mut warnings)[0].read_bytes_per_sec,
+                Some(0.0)
+            );
+            assert!(warnings.is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_during_diskstats_read_does_not_seed_a_mixed_baseline() {
+        use std::{ffi::CString, io::Write, os::unix::ffi::OsStrExt, thread};
+
+        let fixture = Fixture::new();
+        fixture.write("sys/block/sda/diskseq", "10");
+        let old_counters = "8 0 sda 1 0 20 0 2 0 30 0 0 0 0";
+        fixture.write("proc/diskstats", old_counters);
+        let mut collector = Collector::with_roots(fixture.0.join("proc"), fixture.0.join("sys"));
+        collector.sample_disks(&mut Vec::new());
+        let counter_path = fixture.0.join("proc/diskstats");
+        fs::remove_file(&counter_path).unwrap();
+        let fifo_path = CString::new(counter_path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: fifo_path is a live, NUL-terminated path in this test's private directory.
+        assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+        let worker = thread::spawn(move || {
+            let mut warnings = Vec::new();
+            let sample = collector.sample_disks(&mut warnings);
+            (collector, sample, warnings)
+        });
+        // Opening the writer waits until sample_disks has captured identities
+        // and opened the counter file. Publish old counters only after hotplug.
+        let mut writer = fs::OpenOptions::new()
+            .write(true)
+            .open(&counter_path)
+            .unwrap();
+        fixture.write("sys/block/sda/diskseq", "11");
+        writer.write_all(old_counters.as_bytes()).unwrap();
+        drop(writer);
+        let (mut collector, raced, warnings) = worker.join().unwrap();
+        assert_eq!(raced[0].read_bytes_per_sec, None);
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("disk identity"))
+        );
+
+        fs::remove_file(&counter_path).unwrap();
+        fixture.write("proc/diskstats", "8 0 sda 1 0 1000 0 2 0 2000 0 0 0 0");
+        let mut warnings = Vec::new();
+        let fresh = collector.sample_disks(&mut warnings);
+        assert_eq!(fresh[0].read_bytes_per_sec, None);
+        assert_eq!(fresh[0].write_bytes_per_sec, None);
+        assert_eq!(
+            collector.sample_disks(&mut warnings)[0].read_bytes_per_sec,
+            Some(0.0)
+        );
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
     fn replacing_a_network_interface_requires_a_new_baseline() {
         let fixture = Fixture::new();
         fixture.write("sys/class/net/tun0/ifindex", "7");
@@ -1290,12 +1486,198 @@ mod tests {
         fixture.write("class/thermal/thermal_zone1/trip_point_0_type", "critical");
         fixture.write("class/thermal/thermal_zone1/trip_point_0_temp", "105000");
         let sensors = discover_sensors(&fixture.0, &mut Vec::new());
-        assert_eq!(sensors.len(), 2);
+        // Equal readings and compatible driver names do not prove a shared input.
+        assert_eq!(sensors.len(), 3);
         assert!(sensors[0].is_cpu);
         assert_eq!(sensors[0].label, "coretemp · Package id 0");
         assert_eq!(sensors[0].celsius, 51.5);
         assert_eq!(sensors[0].critical_celsius, Some(100.0));
-        assert_eq!(sensors[1].critical_celsius, Some(105.0));
+        assert_eq!(sensors[1].label, "x86_pkg_temp");
+        assert_eq!(sensors[2].critical_celsius, Some(105.0));
+    }
+
+    #[test]
+    fn temperature_zones_fill_partial_hwmon_package_readings() {
+        let fixture = Fixture::new();
+        fixture.write("class/hwmon/hwmon0/name", "coretemp");
+        fixture.write("class/hwmon/hwmon0/temp1_label", "Package id 0");
+        fixture.write("class/hwmon/hwmon0/temp1_input", "40000");
+        fixture.write("class/hwmon/hwmon1/name", "coretemp");
+        fixture.write("class/hwmon/hwmon1/temp1_label", "Package id 1");
+        fixture.write("class/hwmon/hwmon1/temp2_label", "Core 0");
+        fixture.write("class/hwmon/hwmon1/temp2_input", "45000");
+        fixture.write("class/thermal/thermal_zone0/type", "x86_pkg_temp");
+        fixture.write("class/thermal/thermal_zone0/temp", "40000");
+        fixture.write("class/thermal/thermal_zone1/type", "x86_pkg_temp");
+        fixture.write("class/thermal/thermal_zone1/temp", "80000");
+
+        // Another package and a readable core must not hide this package's zone.
+        for package_input in [None, Some("invalid")] {
+            if let Some(value) = package_input {
+                fixture.write("class/hwmon/hwmon1/temp1_input", value);
+            }
+            let snapshot = Snapshot {
+                sensors: discover_sensors(&fixture.0, &mut Vec::new()),
+                ..Snapshot::default()
+            };
+            assert_eq!(snapshot.cpu_temperature(), Some(80.0));
+            assert_eq!(snapshot.sensors.len(), 4);
+            assert_eq!(
+                snapshot
+                    .sensors
+                    .iter()
+                    .filter(|sensor| sensor.label == "x86_pkg_temp")
+                    .count(),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn temperature_zones_with_the_same_driver_remain_independent() {
+        let fixture = Fixture::new();
+        fixture.write("class/hwmon/hwmon0/name", "acpitz");
+        fixture.write("class/hwmon/hwmon0/temp1_input", "40000");
+        fixture.write("class/hwmon/hwmon0/temp2_input", "invalid");
+        fixture.write("class/thermal/thermal_zone0/type", "acpitz");
+        fixture.write("class/thermal/thermal_zone0/temp", "40000");
+        fixture.write("class/thermal/thermal_zone1/type", "acpitz");
+        fixture.write("class/thermal/thermal_zone1/temp", "80000");
+        let mut warnings = Vec::new();
+        let sensors = discover_sensors(&fixture.0, &mut warnings);
+        assert_eq!(sensors.len(), 3);
+        assert_eq!(
+            sensors
+                .iter()
+                .filter(|sensor| sensor.celsius == 40.0)
+                .count(),
+            2
+        );
+        assert_eq!(
+            sensors
+                .iter()
+                .filter(|sensor| sensor.celsius == 80.0)
+                .count(),
+            1
+        );
+        assert_eq!(
+            warnings,
+            ["1 temperature reading(s) were unavailable or invalid."]
+        );
+    }
+
+    #[test]
+    fn temperature_aliases_share_measurement_rejections_and_recover() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new();
+        fixture.write("class/hwmon/hwmon0/name", "acpitz");
+        fixture.write("class/hwmon/hwmon0/temp1_input", "55000");
+        fixture.write("class/hwmon/hwmon0/temp1_crit", "95000");
+        fixture.write("class/thermal/thermal_zone0/type", "acpitz");
+        fixture.write("class/thermal/thermal_zone0/trip_point_0_type", "critical");
+        fixture.write("class/thermal/thermal_zone0/trip_point_0_temp", "95000");
+        symlink(
+            fixture.0.join("class/hwmon/hwmon0/temp1_input"),
+            fixture.0.join("class/thermal/thermal_zone0/temp"),
+        )
+        .unwrap();
+
+        let mut warnings = Vec::new();
+        let sensors = discover_sensors(&fixture.0, &mut warnings);
+        assert_eq!(sensors.len(), 1);
+        assert_eq!(sensors[0].label, "acpitz · temp1");
+        assert_eq!(sensors[0].critical_celsius, Some(95.0));
+        assert!(warnings.is_empty());
+
+        // A fault invalidates this input through both paths even though the
+        // thermal alias does not expose its own fault flag.
+        fixture.write("class/hwmon/hwmon0/temp1_fault", "1");
+        let sensors = discover_sensors(&fixture.0, &mut warnings);
+        assert!(sensors.is_empty());
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("Temperature sensors are unavailable"))
+        );
+
+        fixture.write("class/hwmon/hwmon0/temp1_fault", "0");
+        warnings.clear();
+        let sensors = discover_sensors(&fixture.0, &mut warnings);
+        assert_eq!(sensors.len(), 1);
+        assert_eq!(sensors[0].label, "acpitz · temp1");
+        assert!(warnings.is_empty());
+
+        fixture.write("class/hwmon/hwmon0/temp1_enable", "0");
+        assert!(discover_sensors(&fixture.0, &mut Vec::new()).is_empty());
+        fixture.write("class/hwmon/hwmon0/temp1_enable", "1");
+        assert_eq!(discover_sensors(&fixture.0, &mut Vec::new()).len(), 1);
+
+        // The legacy view is scanned after the modern one. A rejection found
+        // later must also invalidate a reading accepted through the first view.
+        fixture.write("class/hwmon/hwmon0/device/temp1_fault", "1");
+        symlink(
+            fixture.0.join("class/hwmon/hwmon0/temp1_input"),
+            fixture.0.join("class/hwmon/hwmon0/device/temp1_input"),
+        )
+        .unwrap();
+        assert!(discover_sensors(&fixture.0, &mut Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn temperature_vt1211_requires_conversion_except_for_its_internal_diode() {
+        for directory in ["class/hwmon/hwmon0", "class/hwmon/hwmon0/device"] {
+            let fixture = Fixture::new();
+            fixture.write(&format!("{directory}/name"), "vt1211");
+            // temp1 is a thermal diode requiring board-specific offset/gain.
+            fixture.write(&format!("{directory}/temp1_input"), "100000");
+            fixture.write(&format!("{directory}/temp2_input"), "42000");
+            fixture.write(&format!("{directory}/temp2_crit"), "100000");
+            for channel in 3..=7 {
+                // Upstream temp_from_reg(channel - 1, 148) returns 1100 mV.
+                fixture.write(&format!("{directory}/temp{channel}_input"), "1100");
+            }
+            let mut warnings = Vec::new();
+            let sensors = discover_sensors(&fixture.0, &mut warnings);
+            assert_eq!(sensors.len(), 1);
+            assert_eq!(sensors[0].label, "vt1211 · temp2");
+            assert_eq!(sensors[0].celsius, 42.0);
+            assert_eq!(sensors[0].critical_celsius, Some(100.0));
+            assert_eq!(
+                warnings,
+                [
+                    "6 VT1211 external sensor channel(s) require board-specific conversion and are omitted."
+                ]
+            );
+
+            // Channel numbers alone must not suppress another driver's sensors.
+            fixture.write(&format!("{directory}/name"), "other");
+            warnings.clear();
+            assert_eq!(discover_sensors(&fixture.0, &mut warnings).len(), 7);
+            assert!(warnings.is_empty());
+        }
+    }
+
+    #[test]
+    fn temperature_vt1211_conversion_notice_remains_without_usable_channels() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new();
+        fixture.write("class/hwmon/hwmon0/name", "vt1211");
+        fixture.write("class/hwmon/hwmon0/temp3_input", "1100");
+        fixture.write("class/thermal/thermal_zone0/type", "vt1211");
+        symlink(
+            fixture.0.join("class/hwmon/hwmon0/temp3_input"),
+            fixture.0.join("class/thermal/thermal_zone0/temp"),
+        )
+        .unwrap();
+        let mut warnings = Vec::new();
+        assert!(discover_sensors(&fixture.0, &mut warnings).is_empty());
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("require board-specific conversion"))
+        );
     }
 
     #[test]
@@ -1347,6 +1729,8 @@ mod tests {
 
     #[test]
     fn peci_control_targets_are_excluded_but_measurements_and_limits_remain() {
+        use std::os::unix::fs::symlink;
+
         let fixture = Fixture::new();
         fixture.write("class/hwmon/hwmon0/name", "peci_cputemp.cpu0");
         for (channel, label, value) in [
@@ -1365,6 +1749,13 @@ mod tests {
         fixture.write("class/hwmon/hwmon1/name", "coretemp");
         fixture.write("class/hwmon/hwmon1/temp3_label", "Core 1");
         fixture.write("class/hwmon/hwmon1/temp3_input", "43000");
+        // A second path to Tjmax must not turn the control target into a sensor.
+        fixture.write("class/thermal/thermal_zone0/type", "peci_cputemp.cpu0");
+        symlink(
+            fixture.0.join("class/hwmon/hwmon0/temp5_input"),
+            fixture.0.join("class/thermal/thermal_zone0/temp"),
+        )
+        .unwrap();
         let mut warnings = Vec::new();
         let sensors = discover_sensors(&fixture.0, &mut warnings);
         assert_eq!(sensors.len(), 4);

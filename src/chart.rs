@@ -14,9 +14,17 @@ use crate::theme;
 pub struct Series {
     pub name: String,
     pub color: Color32,
+    /// Monotonic timestamp at x = 0, shared by every series in this chart.
+    pub time_origin: f64,
     /// Seconds relative to now, from -60 to 0. A non-finite y breaks the line.
     pub points: Vec<[f64; 2]>,
     pub dashed: bool,
+}
+
+#[derive(Clone, Copy)]
+struct HistoryCursor {
+    selected_at: f64,
+    latest_at: f64,
 }
 
 pub fn show(
@@ -253,12 +261,25 @@ fn inspect_history(
     times.sort_by(f64::total_cmp);
     times.dedup_by(|a, b| (*a - *b).abs() < 0.000_001);
     let last = times.len().saturating_sub(1);
+    let time_origin = series.first().map_or(0.0, |series| series.time_origin);
     let state_id = response.id.with("history_cursor");
-    let mut index = ui
-        .data(|data| data.get_temp::<usize>(state_id))
-        .unwrap_or(last)
-        .min(last);
+    let cursor = ui.data(|data| data.get_temp::<HistoryCursor>(state_id));
+    // Retain the observation, rather than its moving position in the deque.
+    // An expired observation falls back to the nearest remaining boundary;
+    // a restarted monotonic timeline begins at its newest observation.
+    let mut index = cursor
+        .filter(|cursor| time_origin >= cursor.latest_at)
+        .and_then(|cursor| {
+            let seconds = cursor.selected_at - time_origin;
+            times
+                .iter()
+                .enumerate()
+                .min_by(|(_, a), (_, b)| (*a - seconds).abs().total_cmp(&(*b - seconds).abs()))
+                .map(|(index, _)| index)
+        })
+        .unwrap_or(last);
     let old_index = index;
+    let mut cursor_action = false;
     if response.clicked() {
         response.request_focus();
         if let Some(pointer) = response
@@ -318,16 +339,31 @@ fn inspect_history(
                 }
                 _ => return false,
             }
+            cursor_action = true;
             true
         });
     });
     if index != old_index {
         response.mark_changed();
     }
-    if response.has_focus() || index != old_index {
-        ui.data_mut(|data| data.insert_temp(state_id, index));
-    }
     let selected_time = times.get(index).copied();
+    if let Some(seconds) = selected_time {
+        if response.has_focus() || cursor_action || cursor.is_some() {
+            ui.data_mut(|data| {
+                data.insert_temp(
+                    state_id,
+                    HistoryCursor {
+                        selected_at: time_origin + seconds,
+                        latest_at: time_origin,
+                    },
+                );
+            });
+        }
+    } else {
+        // Resume clears history before collecting its new baseline. Do not
+        // carry a cursor from that previous run into the new observations.
+        ui.data_mut(|data| data.remove::<HistoryCursor>(state_id));
+    }
     let label = format!(
         "{name}, 60-second history. Left and Right inspect samples; Home selects oldest; End selects newest; Escape leaves the chart."
     );
@@ -507,6 +543,7 @@ mod tests {
         Series {
             name: "Test".to_owned(),
             color: theme::BLUE,
+            time_origin: 0.0,
             points,
             dashed: false,
         }
@@ -710,74 +747,177 @@ mod tests {
         }
     }
 
+    fn inspection_frame(
+        ctx: &egui::Context,
+        series: &[Series],
+        key: Option<egui::Key>,
+        focus: bool,
+    ) -> (Option<f64>, bool, String) {
+        let events = key
+            .map(|key| egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            })
+            .into_iter()
+            .collect();
+        let mut selected = None;
+        let mut focused = false;
+        let output = ctx.run_ui(
+            egui::RawInput {
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                let (rect, mut response) =
+                    ui.allocate_exact_size(egui::vec2(300.0, 78.0), Sense::click());
+                if focus {
+                    response.request_focus();
+                }
+                selected = inspect_history(ui, &mut response, "Test", series, rect, "%");
+                focused = response.has_focus();
+            },
+        );
+        let value = output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .find(|(_, node)| node.role() == egui::accesskit::Role::Slider)
+            .and_then(|(_, node)| node.value())
+            .unwrap()
+            .to_owned();
+        output.drop_without_applying_deltas();
+        (selected, focused, value)
+    }
+
     #[test]
     fn keyboard_inspection_reports_historical_values_and_can_leave_focus() {
-        fn frame(
-            ctx: &egui::Context,
-            series: &[Series],
-            key: Option<egui::Key>,
-            focus: bool,
-        ) -> (Option<f64>, bool, String) {
-            let events = key
-                .map(|key| egui::Event::Key {
-                    key,
-                    physical_key: None,
-                    pressed: true,
-                    repeat: false,
-                    modifiers: egui::Modifiers::NONE,
-                })
-                .into_iter()
-                .collect();
-            let mut selected = None;
-            let mut focused = false;
-            let output = ctx.run_ui(
-                egui::RawInput {
-                    events,
-                    ..Default::default()
-                },
-                |ui| {
-                    let (rect, mut response) =
-                        ui.allocate_exact_size(egui::vec2(300.0, 78.0), Sense::click());
-                    if focus {
-                        response.request_focus();
-                    }
-                    selected = inspect_history(ui, &mut response, "Test", series, rect, "%");
-                    focused = response.has_focus();
-                },
-            );
-            let value = output
-                .platform_output
-                .accesskit_update
-                .as_ref()
-                .unwrap()
-                .nodes
-                .iter()
-                .find(|(_, node)| node.role() == egui::accesskit::Role::Slider)
-                .and_then(|(_, node)| node.value())
-                .unwrap()
-                .to_owned();
-            output.drop_without_applying_deltas();
-            (selected, focused, value)
-        }
-
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         let series = [sample(vec![[-10.0, 12.0], [-5.0, f64::NAN], [0.0, 42.0]])];
-        assert_eq!(frame(&ctx, &series, None, true).0, Some(0.0));
+        assert_eq!(inspection_frame(&ctx, &series, None, true).0, Some(0.0));
         // Install egui's arrow-key focus filter on the following frame.
-        frame(&ctx, &series, None, false);
+        inspection_frame(&ctx, &series, None, false);
         let (selected, focused, accessible_value) =
-            frame(&ctx, &series, Some(egui::Key::ArrowLeft), false);
+            inspection_frame(&ctx, &series, Some(egui::Key::ArrowLeft), false);
         assert_eq!(selected, Some(-5.0));
         assert!(focused);
         assert!(accessible_value.contains("Unavailable"));
-        let (selected, _, value) = frame(&ctx, &series, Some(egui::Key::Home), false);
+        let (selected, _, value) = inspection_frame(&ctx, &series, Some(egui::Key::Home), false);
         assert_eq!(selected, Some(-10.0));
         assert!(value.contains("12.0%"));
         assert_eq!(
-            frame(&ctx, &series, Some(egui::Key::End), false).0,
+            inspection_frame(&ctx, &series, Some(egui::Key::End), false).0,
             Some(0.0)
         );
-        assert!(!frame(&ctx, &series, Some(egui::Key::Escape), false).1);
+        assert!(!inspection_frame(&ctx, &series, Some(egui::Key::Escape), false).1);
+    }
+
+    fn cpu_history_series(history: &crate::history::History) -> [Series; 1] {
+        [Series {
+            time_origin: history.latest_time(),
+            ..sample(history.series(|snapshot| snapshot.cpu_percent))
+        }]
+    }
+
+    fn push_cpu(history: &mut crate::history::History, at: f64, value: Option<f64>) {
+        history.push(
+            at,
+            crate::metrics::Snapshot {
+                cpu_percent: value,
+                ..Default::default()
+            },
+        );
+    }
+
+    #[test]
+    fn inspection_retains_observations_through_startup_trimming_and_interval_changes() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut history = crate::history::History::default();
+        for at in 0..=58 {
+            push_cpu(&mut history, f64::from(at), Some(f64::from(at)));
+        }
+        inspection_frame(&ctx, &cpu_history_series(&history), None, true);
+        inspection_frame(&ctx, &cpu_history_series(&history), None, false);
+        let (selected, _, value) = inspection_frame(
+            &ctx,
+            &cpu_history_series(&history),
+            Some(egui::Key::ArrowLeft),
+            false,
+        );
+        assert_eq!(selected, Some(-1.0));
+        assert!(value.contains("Test: 57.0%"));
+
+        // The original t=57 observation survives growth, deque trimming, and
+        // fractional boundary points caused by changing the polling interval.
+        for at in [59.0, 60.0, 61.0, 61.5, 66.5] {
+            push_cpu(&mut history, at, Some(at));
+            let (selected, _, value) =
+                inspection_frame(&ctx, &cpu_history_series(&history), None, false);
+            assert_eq!(selected, Some(57.0 - at));
+            assert!(value.contains("Test: 57.0%"), "{value}");
+        }
+
+        // Once the observation expires, inspect the oldest remaining point.
+        push_cpu(&mut history, 118.0, Some(118.0));
+        let (selected, _, value) =
+            inspection_frame(&ctx, &cpu_history_series(&history), None, false);
+        assert_eq!(selected, Some(-60.0));
+        assert!(value.contains("Test: 58.0%"));
+    }
+
+    #[test]
+    fn inspection_retains_gaps_and_resets_when_history_is_cleared() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut history = crate::history::History::default();
+        for at in 0..=60 {
+            push_cpu(
+                &mut history,
+                f64::from(at),
+                (at != 59).then_some(f64::from(at)),
+            );
+        }
+        inspection_frame(&ctx, &cpu_history_series(&history), None, true);
+        inspection_frame(&ctx, &cpu_history_series(&history), None, false);
+        inspection_frame(
+            &ctx,
+            &cpu_history_series(&history),
+            Some(egui::Key::ArrowLeft),
+            false,
+        );
+        push_cpu(&mut history, 61.0, Some(61.0));
+        let (selected, _, value) =
+            inspection_frame(&ctx, &cpu_history_series(&history), None, false);
+        assert_eq!(selected, Some(-2.0));
+        assert!(value.contains("Unavailable"));
+
+        history = crate::history::History::default();
+        let (selected, _, value) =
+            inspection_frame(&ctx, &cpu_history_series(&history), None, false);
+        assert_eq!(selected, None);
+        assert_eq!(value, "No samples available");
+        push_cpu(&mut history, 80.0, Some(80.0));
+        push_cpu(&mut history, 81.0, Some(81.0));
+        let (selected, _, value) =
+            inspection_frame(&ctx, &cpu_history_series(&history), None, false);
+        assert_eq!(selected, Some(0.0));
+        assert!(value.contains("Test: 81.0%"));
+
+        // A replacement history with a restarted clock is safe even if its
+        // empty frame was never shown (for example, while on another page).
+        history = crate::history::History::default();
+        push_cpu(&mut history, 1.0, Some(1.0));
+        push_cpu(&mut history, 2.0, Some(2.0));
+        let (selected, _, value) =
+            inspection_frame(&ctx, &cpu_history_series(&history), None, false);
+        assert_eq!(selected, Some(0.0));
+        assert!(value.contains("Test: 2.0%"));
     }
 }

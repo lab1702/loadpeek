@@ -236,6 +236,7 @@ impl Loadpeek {
             name: name.into(),
             color,
             dashed,
+            time_origin: self.history.latest_time(),
             points: self.history.series(select),
         }
     }
@@ -419,7 +420,7 @@ impl Loadpeek {
                 ui.add_space(2.0);
                 ui.label(RichText::new(self.page.subtitle()).color(SUBTEXT));
             });
-            if ui.available_width() > 240.0 {
+            if ui.available_size_before_wrap().x > 240.0 {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.vertical(|ui| {
                         small(ui, "UPTIME");
@@ -1875,5 +1876,66 @@ mod tests {
         assert_eq!(bytes(1024.0 * 1024.0), "1.0 MiB");
         assert_eq!(uptime(90061.0), "1d 1h 1m");
         assert_eq!(uptime(f64::NAN), "Unavailable");
+    }
+
+    #[test]
+    fn network_header_keeps_uptime_on_one_line_when_displayed() {
+        let uptime_text = uptime(90061.0);
+        for size in [
+            egui::vec2(320.0, 240.0),
+            egui::vec2(640.0, 480.0),
+            egui::vec2(1000.0, 800.0),
+            egui::vec2(1440.0, 1000.0),
+        ] {
+            let (mut app, _samples, _commands) = test_app();
+            app.page = Page::Network;
+            app.history.push(
+                0.0,
+                Snapshot {
+                    uptime_secs: 90061.0,
+                    ..Snapshot::default()
+                },
+            );
+            let ctx = egui::Context::default();
+            crate::theme::apply(&ctx);
+            for frame in 0..4 {
+                let output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                        ..Default::default()
+                    },
+                    |ui| app.ui(ui, &mut eframe::Frame::_new_kittest()),
+                );
+                if frame == 3 {
+                    let mut uptime_labels = 0;
+                    for clipped in &output.shapes {
+                        let egui::Shape::Text(text) = &clipped.shape else {
+                            continue;
+                        };
+                        if text.galley.job.text != "UPTIME" && text.galley.job.text != uptime_text {
+                            continue;
+                        }
+                        uptime_labels += 1;
+                        assert_eq!(
+                            text.galley.rows.len(),
+                            1,
+                            "{size:?}: uptime wraps into multiple rows"
+                        );
+                        let rect = text.galley.rect.translate(text.pos.to_vec2());
+                        assert!(
+                            rect.left() >= clipped.clip_rect.left() - 1.0
+                                && rect.right() <= clipped.clip_rect.right() + 1.0,
+                            "{size:?}: uptime {rect:?} exceeds its clip {:?}",
+                            clipped.clip_rect
+                        );
+                    }
+                    // A roomy page should retain both the uptime label and value.
+                    if size.x == 1440.0 {
+                        assert_eq!(uptime_labels, 2);
+                    }
+                }
+                output.drop_without_applying_deltas();
+            }
+        }
     }
 }
