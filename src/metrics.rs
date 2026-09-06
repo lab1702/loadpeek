@@ -1,0 +1,919 @@
+//! Read-only Linux telemetry. Rates use counter deltas and monotonic elapsed time.
+//!
+//! Kernel interfaces: https://docs.kernel.org/filesystems/proc.html,
+//! https://docs.kernel.org/block/stat.html, and
+//! https://docs.kernel.org/hwmon/sysfs-interface.html.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+#[derive(Clone, Debug, Default)]
+pub struct Snapshot {
+    pub uptime_secs: f64,
+    pub load: [f64; 3],
+    pub cpu_percent: Option<f64>,
+    pub cores: Vec<Core>,
+    pub cpu_model: String,
+    pub hostname: String,
+    pub kernel: String,
+    pub memory: Memory,
+    pub disks: Vec<Disk>,
+    pub networks: Vec<Network>,
+    pub sensors: Vec<Sensor>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Core {
+    pub id: usize,
+    pub percent: Option<f64>,
+    pub frequency_mhz: Option<f64>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Memory {
+    pub total_bytes: u64,
+    pub available_bytes: u64,
+    pub used_bytes: u64,
+    /// Reclaimable page/slab cache, excluding shared memory and buffers.
+    pub cached_bytes: u64,
+    pub swap_total_bytes: u64,
+    pub swap_used_bytes: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Disk {
+    pub name: String,
+    pub read_bytes_per_sec: Option<f64>,
+    pub write_bytes_per_sec: Option<f64>,
+    pub total_read_bytes: u64,
+    pub total_write_bytes: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Network {
+    pub name: String,
+    pub received_bytes_per_sec: Option<f64>,
+    pub transmitted_bytes_per_sec: Option<f64>,
+    pub total_received_bytes: u64,
+    pub total_transmitted_bytes: u64,
+    pub is_up: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Sensor {
+    pub id: String,
+    pub label: String,
+    pub celsius: f64,
+    pub critical_celsius: Option<f64>,
+    pub is_cpu: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CpuTimes([u64; 8]);
+
+#[derive(Clone, Copy, Debug)]
+struct Counters {
+    first: u64,
+    second: u64,
+}
+
+#[derive(Debug)]
+pub struct Collector {
+    proc_root: PathBuf,
+    sys_root: PathBuf,
+    previous_cpu: BTreeMap<String, CpuTimes>,
+    previous_disks: BTreeMap<String, Counters>,
+    previous_networks: BTreeMap<String, Counters>,
+    previous_disk_time: Option<Instant>,
+    previous_network_time: Option<Instant>,
+    hostname: String,
+    kernel: String,
+}
+
+impl Default for Collector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Collector {
+    pub fn new() -> Self {
+        Self::with_roots(PathBuf::from("/proc"), PathBuf::from("/sys"))
+    }
+
+    fn with_roots(proc_root: PathBuf, sys_root: PathBuf) -> Self {
+        Self {
+            hostname: read_trimmed(proc_root.join("sys/kernel/hostname"))
+                .unwrap_or_else(|| "Linux host".into()),
+            kernel: read_trimmed(proc_root.join("sys/kernel/osrelease"))
+                .unwrap_or_else(|| "Unavailable".into()),
+            proc_root,
+            sys_root,
+            previous_cpu: BTreeMap::new(),
+            previous_disks: BTreeMap::new(),
+            previous_networks: BTreeMap::new(),
+            previous_disk_time: None,
+            previous_network_time: None,
+        }
+    }
+
+    pub fn sample(&mut self) -> Snapshot {
+        let mut snapshot = Snapshot {
+            uptime_secs: f64::NAN,
+            load: [f64::NAN; 3],
+            hostname: self.hostname.clone(),
+            kernel: self.kernel.clone(),
+            ..Snapshot::default()
+        };
+        if let Some(text) = read_required(&self.proc_root.join("uptime"), &mut snapshot.warnings) {
+            if let Some(value) = text.split_whitespace().next().and_then(parse_nonnegative) {
+                snapshot.uptime_secs = value;
+            } else {
+                snapshot
+                    .warnings
+                    .push("System uptime could not be parsed.".into());
+            }
+        }
+        if let Some(text) = read_required(&self.proc_root.join("loadavg"), &mut snapshot.warnings) {
+            for (target, token) in snapshot.load.iter_mut().zip(text.split_whitespace()) {
+                *target = parse_nonnegative(token).unwrap_or(f64::NAN);
+            }
+            if snapshot.load.iter().any(|value| !value.is_finite()) {
+                snapshot
+                    .warnings
+                    .push("Load averages are unavailable or incomplete.".into());
+            }
+        }
+
+        let cpuinfo = read_required(&self.proc_root.join("cpuinfo"), &mut snapshot.warnings)
+            .unwrap_or_default();
+        let (model, frequencies) = parse_cpuinfo(&cpuinfo);
+        snapshot.cpu_model = model;
+        if let Some(text) = read_required(&self.proc_root.join("stat"), &mut snapshot.warnings) {
+            let cpu = parse_cpu_times(&text);
+            snapshot.cpu_percent = cpu.get("cpu").and_then(|current| {
+                self.previous_cpu
+                    .get("cpu")
+                    .and_then(|previous| cpu_percent(*previous, *current))
+            });
+            if !cpu.contains_key("cpu") {
+                snapshot
+                    .warnings
+                    .push("CPU utilization counters are unavailable.".into());
+            }
+            for (name, current) in &cpu {
+                let Some(id) = name
+                    .strip_prefix("cpu")
+                    .and_then(|id| id.parse::<usize>().ok())
+                else {
+                    continue;
+                };
+                let percent = self
+                    .previous_cpu
+                    .get(name)
+                    .and_then(|previous| cpu_percent(*previous, *current));
+                let frequency_mhz = self
+                    .cpu_frequency(id)
+                    .or_else(|| frequencies.get(&id).copied());
+                snapshot.cores.push(Core {
+                    id,
+                    percent,
+                    frequency_mhz,
+                });
+            }
+            snapshot.cores.sort_by_key(|core| core.id);
+            self.previous_cpu = cpu;
+        } else {
+            self.previous_cpu.clear();
+        }
+        if !snapshot.cores.is_empty()
+            && snapshot
+                .cores
+                .iter()
+                .all(|core| core.frequency_mhz.is_none())
+        {
+            snapshot
+                .warnings
+                .push("CPU clock readings are not exposed by this system.".into());
+        }
+
+        if let Some(text) = read_required(&self.proc_root.join("meminfo"), &mut snapshot.warnings) {
+            if let Some((memory, estimated)) = parse_memory(&text) {
+                snapshot.memory = memory;
+                if estimated {
+                    snapshot.warnings.push(
+                        "Available memory is estimated because MemAvailable is not exposed.".into(),
+                    );
+                }
+            } else {
+                snapshot
+                    .warnings
+                    .push("Memory counters are unavailable or invalid.".into());
+            }
+        }
+        snapshot.disks = self.sample_disks(&mut snapshot.warnings);
+        snapshot.networks = self.sample_networks(&mut snapshot.warnings);
+        snapshot.sensors = discover_sensors(&self.sys_root, &mut snapshot.warnings);
+        snapshot
+    }
+
+    fn cpu_frequency(&self, id: usize) -> Option<f64> {
+        let path = self
+            .sys_root
+            .join(format!("devices/system/cpu/cpu{id}/cpufreq"));
+        ["cpuinfo_cur_freq", "scaling_cur_freq"]
+            .into_iter()
+            .find_map(|file| {
+                read_trimmed(path.join(file))
+                    .and_then(|text| parse_positive(&text))
+                    .map(|khz| khz / 1000.0)
+            })
+    }
+
+    fn sample_disks(&mut self, warnings: &mut Vec<String>) -> Vec<Disk> {
+        let Some(text) = read_required(&self.proc_root.join("diskstats"), warnings) else {
+            self.previous_disks.clear();
+            self.previous_disk_time = None;
+            return Vec::new();
+        };
+        let now = Instant::now();
+        let elapsed = self
+            .previous_disk_time
+            .map(|previous| now.duration_since(previous).as_secs_f64());
+        let Some(devices) = leaf_block_devices(&self.sys_root, warnings) else {
+            self.previous_disks.clear();
+            self.previous_disk_time = None;
+            return Vec::new();
+        };
+        let counters: BTreeMap<_, _> = parse_diskstats(&text)
+            .into_iter()
+            .filter(|(name, _)| devices.contains(name))
+            .collect();
+        let disks = counters
+            .iter()
+            .map(|(name, current)| {
+                let previous = self.previous_disks.get(name);
+                Disk {
+                    name: name.clone(),
+                    read_bytes_per_sec: previous
+                        .and_then(|previous| counter_rate(previous.first, current.first, elapsed)),
+                    write_bytes_per_sec: previous.and_then(|previous| {
+                        counter_rate(previous.second, current.second, elapsed)
+                    }),
+                    total_read_bytes: current.first,
+                    total_write_bytes: current.second,
+                }
+            })
+            .collect::<Vec<_>>();
+        if disks.is_empty() {
+            warnings.push("No readable whole-disk I/O counters were found.".into());
+        }
+        self.previous_disks = counters;
+        self.previous_disk_time = Some(now);
+        disks
+    }
+
+    fn sample_networks(&mut self, warnings: &mut Vec<String>) -> Vec<Network> {
+        let Some(text) = read_required(&self.proc_root.join("net/dev"), warnings) else {
+            self.previous_networks.clear();
+            self.previous_network_time = None;
+            return Vec::new();
+        };
+        let now = Instant::now();
+        let elapsed = self
+            .previous_network_time
+            .map(|previous| now.duration_since(previous).as_secs_f64());
+        let counters = parse_networks(&text);
+        let networks = counters
+            .iter()
+            .map(|(name, current)| {
+                let previous = self.previous_networks.get(name);
+                let interface = self.sys_root.join("class/net").join(name);
+                // IFF_UP is administrative state; unlike operstate it also describes virtual links.
+                let is_up = read_trimmed(interface.join("flags"))
+                    .and_then(|text| u32::from_str_radix(text.trim_start_matches("0x"), 16).ok())
+                    .map(|flags| flags & 1 != 0)
+                    .unwrap_or_else(|| {
+                        read_trimmed(interface.join("operstate")).is_some_and(|state| state == "up")
+                    });
+                Network {
+                    name: name.clone(),
+                    received_bytes_per_sec: previous
+                        .and_then(|previous| counter_rate(previous.first, current.first, elapsed)),
+                    transmitted_bytes_per_sec: previous.and_then(|previous| {
+                        counter_rate(previous.second, current.second, elapsed)
+                    }),
+                    total_received_bytes: current.first,
+                    total_transmitted_bytes: current.second,
+                    is_up,
+                }
+            })
+            .collect::<Vec<_>>();
+        if networks.is_empty() {
+            warnings.push("No non-loopback network interfaces were found.".into());
+        }
+        self.previous_networks = counters;
+        self.previous_network_time = Some(now);
+        networks
+    }
+}
+
+fn read_trimmed(path: impl AsRef<Path>) -> Option<String> {
+    fs::read_to_string(path)
+        .ok()
+        .map(|text| text.trim().to_owned())
+        .filter(|text| !text.is_empty())
+}
+
+fn read_required(path: &Path, warnings: &mut Vec<String>) -> Option<String> {
+    match fs::read_to_string(path) {
+        Ok(text) => Some(text),
+        Err(error) => {
+            warnings.push(format!("Cannot read {}: {error}", path.display()));
+            None
+        }
+    }
+}
+
+fn parse_nonnegative(text: &str) -> Option<f64> {
+    text.parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite() && *value >= 0.0)
+}
+
+fn parse_positive(text: &str) -> Option<f64> {
+    parse_nonnegative(text).filter(|value| *value > 0.0)
+}
+
+fn parse_cpu_times(text: &str) -> BTreeMap<String, CpuTimes> {
+    text.lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let name = fields.next()?;
+            if name != "cpu"
+                && name
+                    .strip_prefix("cpu")
+                    .and_then(|id| id.parse::<usize>().ok())
+                    .is_none()
+            {
+                return None;
+            }
+            // guest and guest_nice (columns 9/10) already occur in user/nice.
+            let values: Vec<u64> = fields
+                .take(8)
+                .map(str::parse)
+                .collect::<Result<_, _>>()
+                .ok()?;
+            if values.len() < 4 {
+                return None;
+            }
+            let mut counters = [0; 8];
+            counters[..values.len()].copy_from_slice(&values);
+            Some((name.to_owned(), CpuTimes(counters)))
+        })
+        .collect()
+}
+
+fn cpu_percent(previous: CpuTimes, current: CpuTimes) -> Option<f64> {
+    let mut delta = [0u64; 8];
+    for (index, value) in delta.iter_mut().enumerate() {
+        // Linux documents that iowait can decrease without a counter reset.
+        *value = if index == 4 {
+            current.0[index].saturating_sub(previous.0[index])
+        } else {
+            current.0[index].checked_sub(previous.0[index])?
+        };
+    }
+    let total: u128 = delta.iter().map(|value| u128::from(*value)).sum();
+    if total == 0 {
+        return None;
+    }
+    let idle = u128::from(delta[3]) + u128::from(delta[4]);
+    Some(((total - idle) as f64 / total as f64 * 100.0).clamp(0.0, 100.0))
+}
+
+fn parse_cpuinfo(text: &str) -> (String, BTreeMap<usize, f64>) {
+    let mut model = None;
+    let mut frequencies = BTreeMap::new();
+    for block in text.split("\n\n") {
+        let mut id = None;
+        let mut frequency = None;
+        for line in block.lines() {
+            let Some((key, value)) = line.split_once(':') else {
+                continue;
+            };
+            let key = key.trim();
+            let value = value.trim();
+            match key {
+                "processor" => id = value.parse::<usize>().ok(),
+                "cpu MHz" => frequency = parse_positive(value),
+                "model name" | "Hardware" | "Processor" if model.is_none() => {
+                    model = Some(value.to_owned())
+                }
+                _ => {}
+            }
+        }
+        if let (Some(id), Some(frequency)) = (id, frequency) {
+            frequencies.insert(id, frequency);
+        }
+    }
+    (
+        model.unwrap_or_else(|| "Linux processor".into()),
+        frequencies,
+    )
+}
+
+fn parse_memory(text: &str) -> Option<(Memory, bool)> {
+    let values: BTreeMap<&str, u64> = text
+        .lines()
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            let mut fields = value.split_whitespace();
+            let amount = fields.next()?.parse::<u64>().ok()?;
+            if fields.next() != Some("kB") {
+                return None;
+            }
+            Some((name, amount.checked_mul(1024)?))
+        })
+        .collect();
+    let total = *values.get("MemTotal")?;
+    if total == 0 {
+        return None;
+    }
+    let get = |name: &str| values.get(name).copied().unwrap_or(0);
+    let cached = get("Cached")
+        .saturating_add(get("SReclaimable"))
+        .saturating_sub(get("Shmem"))
+        .min(total);
+    let estimated = !values.contains_key("MemAvailable");
+    let available = if estimated {
+        values
+            .get("MemFree")?
+            .saturating_add(get("Buffers"))
+            .saturating_add(cached)
+    } else {
+        get("MemAvailable")
+    }
+    .min(total);
+    let swap_total = get("SwapTotal");
+    Some((
+        Memory {
+            total_bytes: total,
+            available_bytes: available,
+            used_bytes: total.saturating_sub(available),
+            cached_bytes: cached,
+            swap_total_bytes: swap_total,
+            swap_used_bytes: swap_total.saturating_sub(get("SwapFree")),
+        },
+        estimated,
+    ))
+}
+
+fn parse_diskstats(text: &str) -> BTreeMap<String, Counters> {
+    text.lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() < 10 {
+                return None;
+            }
+            // Diskstats always uses 512-byte sectors, even on 4K-native disks.
+            let read = fields[5].parse::<u64>().ok()?.checked_mul(512)?;
+            let written = fields[9].parse::<u64>().ok()?.checked_mul(512)?;
+            Some((
+                fields[2].to_owned(),
+                Counters {
+                    first: read,
+                    second: written,
+                },
+            ))
+        })
+        .collect()
+}
+
+fn leaf_block_devices(sys_root: &Path, warnings: &mut Vec<String>) -> Option<BTreeSet<String>> {
+    let root = sys_root.join("block");
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) => {
+            warnings.push(format!(
+                "Cannot discover whole disks in {}: {error}",
+                root.display()
+            ));
+            return None;
+        }
+    };
+    let mut devices = BTreeSet::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if ["loop", "ram", "zram"]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+        {
+            continue;
+        }
+        // Whole-device entries exclude partitions. Stacked DM/MD devices repeat
+        // I/O already accounted by their slave disks, so only retain leaf devices.
+        match fs::read_dir(entry.path().join("slaves")) {
+            Ok(mut slaves) => {
+                if slaves.next().is_some() {
+                    continue;
+                }
+            }
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                warnings.push(format!("Cannot inspect {name} disk topology: {error}"));
+                continue;
+            }
+            _ => {}
+        }
+        devices.insert(name);
+    }
+    Some(devices)
+}
+
+fn parse_networks(text: &str) -> BTreeMap<String, Counters> {
+    text.lines()
+        .filter_map(|line| {
+            let (name, values) = line.rsplit_once(':')?;
+            let name = name.trim();
+            if name.is_empty() || name == "lo" {
+                return None;
+            }
+            let fields: Vec<&str> = values.split_whitespace().collect();
+            if fields.len() < 16 {
+                return None;
+            }
+            Some((
+                name.to_owned(),
+                Counters {
+                    first: fields[0].parse().ok()?,
+                    second: fields[8].parse().ok()?,
+                },
+            ))
+        })
+        .collect()
+}
+
+fn counter_rate(previous: u64, current: u64, elapsed: Option<f64>) -> Option<f64> {
+    let seconds = elapsed.filter(|seconds| seconds.is_finite() && *seconds > 0.0)?;
+    let delta = current.checked_sub(previous)?;
+    let rate = delta as f64 / seconds;
+    rate.is_finite().then_some(rate)
+}
+
+fn cpu_sensor_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    [
+        "coretemp",
+        "k10temp",
+        "k8temp",
+        "zenpower",
+        "cpu",
+        "x86_pkg",
+        "soc_thermal",
+        "tctl",
+        "tdie",
+    ]
+    .iter()
+    .any(|part| name.contains(part))
+}
+
+fn read_temperature(path: &Path) -> Option<f64> {
+    let value = read_trimmed(path)?.parse::<f64>().ok()? / 1000.0;
+    // Reject kernel sentinel values and readings outside credible device ranges.
+    (value.is_finite() && (-100.0..=250.0).contains(&value)).then_some(value)
+}
+
+fn discover_sensors(sys_root: &Path, warnings: &mut Vec<String>) -> Vec<Sensor> {
+    let mut sensors = Vec::new();
+    let mut sources = BTreeSet::new();
+    let mut hwmon_drivers = BTreeSet::new();
+    let mut inaccessible = 0;
+    if let Ok(entries) = fs::read_dir(sys_root.join("class/hwmon")) {
+        for entry in entries.flatten() {
+            let root = entry.path();
+            let driver = read_trimmed(root.join("name"))
+                .unwrap_or_else(|| entry.file_name().to_string_lossy().into_owned());
+            // Some older drivers expose attributes under hwmonN/device.
+            for directory in [root.clone(), root.join("device")] {
+                let Ok(attributes) = fs::read_dir(&directory) else {
+                    continue;
+                };
+                for attribute in attributes.flatten() {
+                    let name = attribute.file_name().to_string_lossy().into_owned();
+                    let Some(channel) = name.strip_suffix("_input").filter(|name| {
+                        name.strip_prefix("temp").is_some_and(|id| {
+                            !id.is_empty() && id.chars().all(|character| character.is_ascii_digit())
+                        })
+                    }) else {
+                        continue;
+                    };
+                    let path = attribute.path();
+                    let canonical = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                    if !sources.insert(canonical.clone()) {
+                        continue;
+                    }
+                    if read_trimmed(directory.join(format!("{channel}_enable"))).as_deref()
+                        == Some("0")
+                    {
+                        continue;
+                    }
+                    let Some(celsius) = read_temperature(&path) else {
+                        inaccessible += 1;
+                        continue;
+                    };
+                    let label = read_trimmed(directory.join(format!("{channel}_label")))
+                        .unwrap_or_else(|| channel.to_owned());
+                    let label = format!("{driver} · {label}");
+                    let critical_celsius =
+                        read_temperature(&directory.join(format!("{channel}_crit")))
+                            .filter(|value| *value > 0.0);
+                    sensors.push(Sensor {
+                        id: canonical.to_string_lossy().into_owned(),
+                        is_cpu: cpu_sensor_name(&label),
+                        label,
+                        celsius,
+                        critical_celsius,
+                    });
+                    hwmon_drivers.insert(driver.to_ascii_lowercase());
+                }
+            }
+        }
+    }
+    // Thermal zones fill gaps where hwmon does not expose the same driver.
+    // Do not deduplicate based on equal temperatures: independent sensors can agree.
+    if let Ok(entries) = fs::read_dir(sys_root.join("class/thermal")) {
+        for entry in entries.flatten() {
+            if !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("thermal_zone")
+            {
+                continue;
+            }
+            let directory = entry.path();
+            let label = read_trimmed(directory.join("type"))
+                .unwrap_or_else(|| entry.file_name().to_string_lossy().into_owned());
+            if hwmon_drivers.contains(&label.to_ascii_lowercase()) {
+                continue;
+            }
+            // x86_pkg_temp and coretemp package channels read the same Intel sensor.
+            if label == "x86_pkg_temp" && hwmon_drivers.contains("coretemp") {
+                continue;
+            }
+            let path = directory.join("temp");
+            let canonical = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            if !sources.insert(canonical.clone()) {
+                continue;
+            }
+            let Some(celsius) = read_temperature(&path) else {
+                inaccessible += 1;
+                continue;
+            };
+            let critical_celsius = fs::read_dir(&directory)
+                .ok()
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|attribute| {
+                    let name = attribute.file_name().to_string_lossy().into_owned();
+                    let prefix = name
+                        .strip_suffix("_type")
+                        .filter(|prefix| prefix.starts_with("trip_point_"))?;
+                    (read_trimmed(attribute.path()).as_deref() == Some("critical"))
+                        .then(|| read_temperature(&directory.join(format!("{prefix}_temp"))))
+                        .flatten()
+                        .filter(|temperature| *temperature > 0.0)
+                })
+                .min_by(f64::total_cmp);
+            sensors.push(Sensor {
+                id: canonical.to_string_lossy().into_owned(),
+                is_cpu: cpu_sensor_name(&label),
+                label,
+                celsius,
+                critical_celsius,
+            });
+        }
+    }
+    sensors.sort_by(|left, right| {
+        right
+            .is_cpu
+            .cmp(&left.is_cpu)
+            .then(left.label.cmp(&right.label))
+            .then(left.id.cmp(&right.id))
+    });
+    if sensors.is_empty() {
+        warnings.push("Temperature sensors are unavailable. Hardware, drivers, or permissions may limit access.".into());
+    } else if inaccessible > 0 {
+        warnings.push(format!(
+            "{inaccessible} temperature reading(s) were unavailable or invalid."
+        ));
+    }
+    sensors
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cpu_guest_time_is_not_counted_twice() {
+        let before = parse_cpu_times("cpu 100 20 30 1000 0 0 0 0 40 10");
+        let after = parse_cpu_times("cpu 150 30 40 1030 0 0 0 0 80 20");
+        assert_eq!(cpu_percent(before["cpu"], after["cpu"]), Some(70.0));
+    }
+
+    #[test]
+    fn cpu_counter_reset_and_unchanged_sample_are_missing() {
+        let counters = CpuTimes([100, 0, 20, 50, 0, 0, 0, 0]);
+        assert_eq!(cpu_percent(counters, counters), None);
+        assert_eq!(
+            cpu_percent(counters, CpuTimes([5, 0, 2, 10, 0, 0, 0, 0])),
+            None
+        );
+    }
+
+    #[test]
+    fn cpu_iowait_decrease_does_not_invalidate_other_counters() {
+        let before = CpuTimes([100, 0, 20, 100, 15, 0, 0, 0]);
+        let after = CpuTimes([120, 0, 30, 170, 10, 0, 0, 0]);
+        assert_eq!(cpu_percent(before, after), Some(30.0));
+    }
+
+    #[test]
+    fn cpu_parser_ignores_other_stat_fields_and_malformed_rows() {
+        let counters = parse_cpu_times(
+            "cpu 1 2 3 4\ncpu0 1 2 3 4 5 6 7 8\ncpu4 1 bad 2 3\ncpufreq 10 20 30 40\nintr 500",
+        );
+        assert_eq!(counters.len(), 2);
+        assert_eq!(counters["cpu"].0, [1, 2, 3, 4, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn rates_use_actual_elapsed_and_preserve_missing_samples() {
+        assert_eq!(counter_rate(100, 300, Some(0.5)), Some(400.0));
+        assert_eq!(counter_rate(100, 300, Some(5.0)), Some(40.0));
+        assert_eq!(counter_rate(100, 100, Some(1.0)), Some(0.0));
+        assert_eq!(counter_rate(300, 100, Some(1.0)), None);
+        assert_eq!(counter_rate(100, 300, Some(0.0)), None);
+        assert_eq!(counter_rate(100, 300, Some(f64::NAN)), None);
+        assert_eq!(counter_rate(100, 300, None), None);
+    }
+
+    #[test]
+    fn disk_sectors_are_always_512_bytes() {
+        let counters = parse_diskstats(
+            "259 0 nvme0n1 255999 814 12369153 47919 996852 81 36123024 425995 0 301795 580470",
+        );
+        assert_eq!(counters["nvme0n1"].first, 12_369_153 * 512);
+        assert_eq!(counters["nvme0n1"].second, 36_123_024 * 512);
+        assert!(parse_diskstats("8 0 bad short line").is_empty());
+    }
+
+    #[test]
+    fn network_parser_separates_receive_transmit_and_omits_loopback() {
+        let counters = parse_networks(
+            "Inter-| Receive | Transmit\n lo: 99 1 0 0 0 0 0 0 99 1 0 0 0 0 0 0\n eth0: 1024 2 0 0 0 0 0 0 2048 4 0 0 0 0 0 0\n bad: 1 2",
+        );
+        assert_eq!(counters.len(), 1);
+        assert_eq!(counters["eth0"].first, 1024);
+        assert_eq!(counters["eth0"].second, 2048);
+    }
+
+    #[test]
+    fn memory_uses_available_not_free_and_converts_kibibytes() {
+        let (memory, estimated) = parse_memory("MemTotal: 1000 kB\nMemAvailable: 400 kB\nMemFree: 100 kB\nCached: 300 kB\nSReclaimable: 50 kB\nShmem: 20 kB\nSwapTotal: 200 kB\nSwapFree: 70 kB").unwrap();
+        assert!(!estimated);
+        assert_eq!(memory.total_bytes, 1_024_000);
+        assert_eq!(memory.used_bytes, 600 * 1024);
+        assert_eq!(memory.cached_bytes, 330 * 1024);
+        assert_eq!(memory.swap_used_bytes, 130 * 1024);
+    }
+
+    #[test]
+    fn memory_fallback_and_inconsistent_counters_are_safe() {
+        let (memory, estimated) =
+            parse_memory("MemTotal: 100 kB\nMemFree: 40 kB\nBuffers: 10 kB\nCached: 80 kB")
+                .unwrap();
+        assert!(estimated);
+        assert_eq!(memory.available_bytes, memory.total_bytes);
+        assert_eq!(memory.used_bytes, 0);
+        assert!(parse_memory("MemFree: 500 kB").is_none());
+        assert!(parse_memory("MemTotal: invalid kB").is_none());
+    }
+
+    #[test]
+    fn cpuinfo_preserves_sparse_core_ids_and_rejects_nan() {
+        let (model, frequencies) = parse_cpuinfo(
+            "processor : 0\nmodel name : Example CPU\ncpu MHz : 1800.5\n\nprocessor : 8\ncpu MHz : NaN\n\nprocessor : 12\ncpu MHz : 2400\n",
+        );
+        assert_eq!(model, "Example CPU");
+        assert_eq!(frequencies.get(&0), Some(&1800.5));
+        assert!(!frequencies.contains_key(&8));
+        assert_eq!(frequencies.get(&12), Some(&2400.0));
+    }
+
+    struct Fixture(PathBuf);
+
+    impl Fixture {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "loadpeek-metrics-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn write(&self, path: &str, text: &str) {
+            let path = self.0.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn collector_first_sample_and_missing_sources_do_not_invent_rates() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "proc/stat",
+            "cpu 100 0 100 800 0 0 0 0\ncpu0 100 0 100 800 0 0 0 0",
+        );
+        fixture.write("proc/diskstats", "8 0 sda 1 0 20 0 2 0 30 0 0 0 0");
+        fixture.write("sys/block/sda/slaves/.keep", "");
+        fs::remove_file(fixture.0.join("sys/block/sda/slaves/.keep")).unwrap();
+        fixture.write("proc/net/dev", "eth0: 100 0 0 0 0 0 0 0 200 0 0 0 0 0 0 0");
+        let mut collector = Collector::with_roots(fixture.0.join("proc"), fixture.0.join("sys"));
+        let sample = collector.sample();
+        assert_eq!(sample.cpu_percent, None);
+        assert_eq!(sample.cores[0].percent, None);
+        assert_eq!(sample.disks[0].read_bytes_per_sec, None);
+        assert_eq!(sample.networks[0].received_bytes_per_sec, None);
+        assert!(sample.uptime_secs.is_nan());
+        assert_eq!(sample.memory.total_bytes, 0);
+        assert!(sample.sensors.is_empty());
+        assert!(!sample.warnings.is_empty());
+        fs::remove_file(fixture.0.join("proc/stat")).unwrap();
+        assert!(collector.sample().cpu_percent.is_none());
+        fixture.write("proc/stat", "cpu 200 0 200 1600 0 0 0 0");
+        assert!(collector.sample().cpu_percent.is_none());
+    }
+
+    #[test]
+    fn block_discovery_omits_memory_disks_and_stacked_devices() {
+        let fixture = Fixture::new();
+        fixture.write("block/nvme0n1/slaves/.keep", "");
+        fs::remove_file(fixture.0.join("block/nvme0n1/slaves/.keep")).unwrap();
+        fixture.write("block/dm-0/slaves/nvme0n1", "");
+        fixture.write("block/loop0/stat", "");
+        fixture.write("block/zram0/stat", "");
+        let devices = leaf_block_devices(&fixture.0, &mut Vec::new()).unwrap();
+        assert_eq!(devices, BTreeSet::from(["nvme0n1".to_owned()]));
+    }
+
+    #[test]
+    fn temperature_discovery_uses_labels_critical_limits_and_fallbacks() {
+        let fixture = Fixture::new();
+        fixture.write("class/hwmon/hwmon0/name", "coretemp");
+        fixture.write("class/hwmon/hwmon0/temp1_label", "Package id 0");
+        fixture.write("class/hwmon/hwmon0/temp1_input", "51500");
+        fixture.write("class/hwmon/hwmon0/temp1_crit", "100000");
+        fixture.write("class/thermal/thermal_zone0/type", "x86_pkg_temp");
+        fixture.write("class/thermal/thermal_zone0/temp", "51500");
+        fixture.write("class/thermal/thermal_zone1/type", "acpitz");
+        fixture.write("class/thermal/thermal_zone1/temp", "43000");
+        fixture.write("class/thermal/thermal_zone1/trip_point_0_type", "critical");
+        fixture.write("class/thermal/thermal_zone1/trip_point_0_temp", "105000");
+        let sensors = discover_sensors(&fixture.0, &mut Vec::new());
+        assert_eq!(sensors.len(), 2);
+        assert!(sensors[0].is_cpu);
+        assert_eq!(sensors[0].label, "coretemp · Package id 0");
+        assert_eq!(sensors[0].celsius, 51.5);
+        assert_eq!(sensors[0].critical_celsius, Some(100.0));
+        assert_eq!(sensors[1].critical_celsius, Some(105.0));
+    }
+
+    #[test]
+    fn invalid_and_disabled_temperature_inputs_stay_missing() {
+        let fixture = Fixture::new();
+        fixture.write("class/hwmon/hwmon0/name", "test");
+        fixture.write("class/hwmon/hwmon0/temp1_input", "-2147483648");
+        fixture.write("class/hwmon/hwmon0/temp2_input", "35000");
+        fixture.write("class/hwmon/hwmon0/temp2_enable", "0");
+        fixture.write("class/hwmon/hwmon0/temp3_input", "NaN");
+        let mut warnings = Vec::new();
+        assert!(discover_sensors(&fixture.0, &mut warnings).is_empty());
+        assert_eq!(warnings.len(), 1);
+    }
+}

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Loadpeek
+GenericName=System Monitor
+Comment=Monitor CPU, memory, disk, network, and temperatures
+Exec=loadpeek
+Icon=utilities-system-monitor
+Terminal=false
+Categories=System;Monitor;
+Keywords=cpu;memory;disk;network;temperature;monitor;
+StartupNotify=true

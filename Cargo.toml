@@ -1,0 +1,20 @@
+[package]
+name = "loadpeek"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "A calm, native Linux system monitor in Catppuccin Mocha"
+license = "MIT"
+
+[dependencies]
+eframe = { version = "0.36.1", default-features = false, features = ["default_fonts", "glow", "x11", "wayland", "accesskit"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[features]
+inspection = ["eframe/inspection"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
