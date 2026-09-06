@@ -26,6 +26,31 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    /// Hottest recognized CPU reading, preferring a device's physical die
+    /// temperature over its offset fan-control value when both are available.
+    pub fn cpu_temperature(&self) -> Option<f64> {
+        let physical_devices: BTreeSet<&str> = self
+            .sensors
+            .iter()
+            .filter(|sensor| sensor.is_cpu && sensor.celsius.is_finite())
+            .filter_map(|sensor| match &sensor.cpu_temperature_source {
+                CpuTemperatureSource::Die { device } => Some(device.as_str()),
+                _ => None,
+            })
+            .collect();
+        self.sensors
+            .iter()
+            .filter(|sensor| sensor.is_cpu && sensor.celsius.is_finite())
+            .filter(|sensor| match &sensor.cpu_temperature_source {
+                CpuTemperatureSource::Control { device } => {
+                    !physical_devices.contains(device.as_str())
+                }
+                _ => true,
+            })
+            .map(|sensor| sensor.celsius)
+            .reduce(f64::max)
+    }
+
     /// Clock statistics across cores with a valid reading in this sample.
     pub fn cpu_frequency_stats(&self) -> Option<FrequencyStats> {
         let mut frequencies = self
@@ -99,6 +124,19 @@ pub struct Sensor {
     pub celsius: f64,
     pub critical_celsius: Option<f64>,
     pub is_cpu: bool,
+    pub(crate) cpu_temperature_source: CpuTemperatureSource,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) enum CpuTemperatureSource {
+    #[default]
+    Other,
+    Control {
+        device: String,
+    },
+    Die {
+        device: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -110,13 +148,19 @@ struct Counters {
     second: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct NetworkBaseline {
+    ifindex: u32,
+    counters: Counters,
+}
+
 #[derive(Debug)]
 pub struct Collector {
     proc_root: PathBuf,
     sys_root: PathBuf,
     previous_cpu: BTreeMap<String, CpuTimes>,
     previous_disks: BTreeMap<String, Counters>,
-    previous_networks: BTreeMap<String, Counters>,
+    previous_networks: BTreeMap<String, NetworkBaseline>,
     previous_disk_time: Option<Instant>,
     previous_network_time: Option<Instant>,
     hostname: String,
@@ -307,6 +351,18 @@ impl Collector {
     }
 
     fn sample_networks(&mut self, warnings: &mut Vec<String>) -> Vec<Network> {
+        // Check identities on both sides of the counter read so a link replaced
+        // during collection cannot seed a baseline with the previous link's data.
+        let identities_before: BTreeMap<_, _> = fs::read_dir(self.sys_root.join("class/net"))
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                Some((name, network_ifindex(&entry.path())?))
+            })
+            .collect();
         let Some(text) = read_required(&self.proc_root.join("net/dev"), warnings) else {
             self.previous_networks.clear();
             self.previous_network_time = None;
@@ -317,11 +373,31 @@ impl Collector {
             .previous_network_time
             .map(|previous| now.duration_since(previous).as_secs_f64());
         let counters = parse_networks(&text);
+        let mut next_baselines = BTreeMap::new();
+        let mut unknown_identities = 0;
         let networks = counters
             .iter()
             .map(|(name, current)| {
-                let previous = self.previous_networks.get(name);
                 let interface = self.sys_root.join("class/net").join(name);
+                let ifindex = network_ifindex(&interface)
+                    .filter(|index| identities_before.get(name) == Some(index));
+                let previous = ifindex.and_then(|index| {
+                    self.previous_networks
+                        .get(name)
+                        .filter(|previous| previous.ifindex == index)
+                        .map(|previous| &previous.counters)
+                });
+                if let Some(ifindex) = ifindex {
+                    next_baselines.insert(
+                        name.clone(),
+                        NetworkBaseline {
+                            ifindex,
+                            counters: *current,
+                        },
+                    );
+                } else {
+                    unknown_identities += 1;
+                }
                 // IFF_UP is administrative state; unlike operstate it also describes virtual links.
                 let is_up = read_trimmed(interface.join("flags"))
                     .and_then(|text| u32::from_str_radix(text.trim_start_matches("0x"), 16).ok())
@@ -345,10 +421,22 @@ impl Collector {
         if networks.is_empty() {
             warnings.push("No non-loopback network interfaces were found.".into());
         }
-        self.previous_networks = counters;
+        if unknown_identities > 0 {
+            warnings.push(format!(
+                "{unknown_identities} network interface identity reading(s) were unavailable or changed during collection; their rates are unavailable."
+            ));
+        }
+        self.previous_networks = next_baselines;
         self.previous_network_time = Some(now);
         networks
     }
+}
+
+fn network_ifindex(interface: &Path) -> Option<u32> {
+    read_trimmed(interface.join("ifindex"))?
+        .parse()
+        .ok()
+        .filter(|index| *index > 0)
 }
 
 fn read_trimmed(path: impl AsRef<Path>) -> Option<String> {
@@ -625,7 +713,12 @@ fn discover_sensors(sys_root: &Path, warnings: &mut Vec<String>) -> Vec<Sensor> 
         for entry in entries.flatten() {
             let root = entry.path();
             let driver = read_trimmed(root.join("name"))
+                .or_else(|| read_trimmed(root.join("device/name")))
                 .unwrap_or_else(|| entry.file_name().to_string_lossy().into_owned());
+            let device = fs::canonicalize(&root)
+                .unwrap_or_else(|_| root.clone())
+                .to_string_lossy()
+                .into_owned();
             let is_peci_cpu = driver == "peci_cputemp" || driver.starts_with("peci_cputemp.");
             // Some older drivers expose attributes under hwmonN/device.
             for directory in [root.clone(), root.join("device")] {
@@ -670,6 +763,15 @@ fn discover_sensors(sys_root: &Path, warnings: &mut Vec<String>) -> Vec<Sensor> 
                     };
                     let label = read_trimmed(directory.join(format!("{channel}_label")))
                         .unwrap_or_else(|| channel.to_owned());
+                    let cpu_temperature_source = match (driver.as_str(), label.as_str()) {
+                        ("k10temp" | "zenpower", "Tctl") => CpuTemperatureSource::Control {
+                            device: device.clone(),
+                        },
+                        ("k10temp" | "zenpower", "Tdie") => CpuTemperatureSource::Die {
+                            device: device.clone(),
+                        },
+                        _ => CpuTemperatureSource::Other,
+                    };
                     let label = format!("{driver} · {label}");
                     let critical_celsius =
                         read_temperature(&directory.join(format!("{channel}_crit")))
@@ -680,6 +782,7 @@ fn discover_sensors(sys_root: &Path, warnings: &mut Vec<String>) -> Vec<Sensor> 
                         label,
                         celsius,
                         critical_celsius,
+                        cpu_temperature_source,
                     });
                     hwmon_drivers.insert(driver.to_ascii_lowercase());
                 }
@@ -738,6 +841,7 @@ fn discover_sensors(sys_root: &Path, warnings: &mut Vec<String>) -> Vec<Sensor> 
                 label,
                 celsius,
                 critical_celsius,
+                cpu_temperature_source: CpuTemperatureSource::Other,
             });
         }
     }
@@ -1000,6 +1104,176 @@ mod tests {
         fixture.write("block/zram0/stat", "");
         let devices = leaf_block_devices(&fixture.0, &mut Vec::new()).unwrap();
         assert_eq!(devices, BTreeSet::from(["nvme0n1".to_owned()]));
+    }
+
+    #[test]
+    fn replacing_a_network_interface_requires_a_new_baseline() {
+        let fixture = Fixture::new();
+        fixture.write("sys/class/net/tun0/ifindex", "7");
+        fixture.write(
+            "proc/net/dev",
+            "tun0: 1000 0 0 0 0 0 0 0 2000 0 0 0 0 0 0 0",
+        );
+        let mut collector = Collector::with_roots(fixture.0.join("proc"), fixture.0.join("sys"));
+        let mut warnings = Vec::new();
+        assert!(
+            collector.sample_networks(&mut warnings)[0]
+                .received_bytes_per_sec
+                .is_none()
+        );
+        let steady = collector.sample_networks(&mut warnings);
+        assert_eq!(steady[0].received_bytes_per_sec, Some(0.0));
+        assert_eq!(steady[0].transmitted_bytes_per_sec, Some(0.0));
+
+        // Reuse the name with larger counters: a decrease cannot detect this.
+        fixture.write("sys/class/net/tun0/ifindex", "8");
+        fixture.write(
+            "proc/net/dev",
+            "tun0: 5000 0 0 0 0 0 0 0 8000 0 0 0 0 0 0 0",
+        );
+        let replaced = collector.sample_networks(&mut warnings);
+        assert_eq!(replaced[0].total_received_bytes, 5000);
+        assert_eq!(replaced[0].total_transmitted_bytes, 8000);
+        assert_eq!(replaced[0].received_bytes_per_sec, None);
+        assert_eq!(replaced[0].transmitted_bytes_per_sec, None);
+        let steady = collector.sample_networks(&mut warnings);
+        assert_eq!(steady[0].received_bytes_per_sec, Some(0.0));
+        assert_eq!(steady[0].transmitted_bytes_per_sec, Some(0.0));
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn missing_or_invalid_interface_identity_preserves_totals_and_reprimes_rates() {
+        let fixture = Fixture::new();
+        fixture.write("sys/class/net/tun0/ifindex", "7");
+        fixture.write("sys/class/net/eth0/ifindex", "2");
+        fixture.write(
+            "proc/net/dev",
+            "tun0: 1000 0 0 0 0 0 0 0 2000 0 0 0 0 0 0 0\neth0: 3000 0 0 0 0 0 0 0 4000 0 0 0 0 0 0 0",
+        );
+        let mut collector = Collector::with_roots(fixture.0.join("proc"), fixture.0.join("sys"));
+        let mut warnings = Vec::new();
+        collector.sample_networks(&mut warnings);
+        collector.sample_networks(&mut warnings);
+
+        for identity in [None, Some(""), Some("0"), Some("-1"), Some("bad")] {
+            if let Some(identity) = identity {
+                fixture.write("sys/class/net/tun0/ifindex", identity);
+            } else {
+                fs::remove_file(fixture.0.join("sys/class/net/tun0/ifindex")).unwrap();
+            }
+            warnings.clear();
+            let unavailable = collector.sample_networks(&mut warnings);
+            let tun = unavailable
+                .iter()
+                .find(|network| network.name == "tun0")
+                .unwrap();
+            assert_eq!(tun.total_received_bytes, 1000);
+            assert_eq!(tun.total_transmitted_bytes, 2000);
+            assert_eq!(tun.received_bytes_per_sec, None);
+            assert_eq!(tun.transmitted_bytes_per_sec, None);
+            let eth = unavailable
+                .iter()
+                .find(|network| network.name == "eth0")
+                .unwrap();
+            assert_eq!(eth.received_bytes_per_sec, Some(0.0));
+            assert_eq!(warnings.len(), 1);
+            assert!(warnings[0].contains("identity"));
+
+            fixture.write("sys/class/net/tun0/ifindex", "7");
+            warnings.clear();
+            let recovered = collector.sample_networks(&mut warnings);
+            let tun = recovered
+                .iter()
+                .find(|network| network.name == "tun0")
+                .unwrap();
+            assert_eq!(tun.received_bytes_per_sec, None);
+            assert_eq!(tun.transmitted_bytes_per_sec, None);
+            let steady = collector.sample_networks(&mut warnings);
+            let tun = steady
+                .iter()
+                .find(|network| network.name == "tun0")
+                .unwrap();
+            assert_eq!(tun.received_bytes_per_sec, Some(0.0));
+            assert_eq!(tun.transmitted_bytes_per_sec, Some(0.0));
+            assert!(warnings.is_empty());
+        }
+    }
+
+    #[test]
+    fn legacy_hwmon_device_names_identify_cpu_readings() {
+        let fixture = Fixture::new();
+        fixture.write("class/hwmon/hwmon0/device/name", "k8temp");
+        fixture.write("class/hwmon/hwmon0/device/temp1_input", "45000");
+        let snapshot = Snapshot {
+            sensors: discover_sensors(&fixture.0, &mut Vec::new()),
+            ..Snapshot::default()
+        };
+        assert_eq!(snapshot.sensors[0].label, "k8temp · temp1");
+        assert!(snapshot.sensors[0].is_cpu);
+        assert_eq!(snapshot.cpu_temperature(), Some(45.0));
+
+        // A name provided on the hwmon class device takes precedence.
+        fixture.write("class/hwmon/hwmon0/name", "coretemp");
+        assert_eq!(
+            discover_sensors(&fixture.0, &mut Vec::new())[0].label,
+            "coretemp · temp1"
+        );
+    }
+
+    fn write_amd_temperatures(fixture: &Fixture, hwmon: usize, die: Option<&str>) {
+        let root = format!("class/hwmon/hwmon{hwmon}");
+        fixture.write(&format!("{root}/name"), "k10temp");
+        fixture.write(&format!("{root}/temp1_label"), "Tctl");
+        fixture.write(&format!("{root}/temp1_input"), "75000");
+        if let Some(die) = die {
+            fixture.write(&format!("{root}/temp2_label"), "Tdie");
+            fixture.write(&format!("{root}/temp2_input"), die);
+        }
+    }
+
+    #[test]
+    fn cpu_temperature_prefers_die_but_retains_control_details_and_hottest_ccd() {
+        let fixture = Fixture::new();
+        write_amd_temperatures(&fixture, 0, Some("55000"));
+        fixture.write("class/hwmon/hwmon0/temp3_label", "Tccd1");
+        fixture.write("class/hwmon/hwmon0/temp3_input", "65000");
+        let snapshot = Snapshot {
+            sensors: discover_sensors(&fixture.0, &mut Vec::new()),
+            ..Snapshot::default()
+        };
+        assert_eq!(snapshot.cpu_temperature(), Some(65.0));
+        assert_eq!(snapshot.sensors.len(), 3);
+        let control = snapshot
+            .sensors
+            .iter()
+            .find(|sensor| sensor.label.ends_with("Tctl"))
+            .unwrap();
+        assert_eq!(control.celsius, 75.0);
+        assert!(control.is_cpu);
+    }
+
+    #[test]
+    fn cpu_temperature_control_fallback_is_per_device_and_recovers_from_faults() {
+        let fixture = Fixture::new();
+        write_amd_temperatures(&fixture, 0, Some("55000"));
+        write_amd_temperatures(&fixture, 1, None);
+        let sample = || Snapshot {
+            sensors: discover_sensors(&fixture.0, &mut Vec::new()),
+            ..Snapshot::default()
+        };
+        // Another CPU's physical reading must not hide this CPU's only channel.
+        assert_eq!(sample().cpu_temperature(), Some(75.0));
+        write_amd_temperatures(&fixture, 1, Some("60000"));
+        assert_eq!(sample().cpu_temperature(), Some(60.0));
+
+        fixture.write("class/hwmon/hwmon1/temp2_fault", "1");
+        assert_eq!(sample().cpu_temperature(), Some(75.0));
+        fixture.write("class/hwmon/hwmon1/temp2_fault", "0");
+        fixture.write("class/hwmon/hwmon1/temp2_input", "NaN");
+        assert_eq!(sample().cpu_temperature(), Some(75.0));
+        fixture.write("class/hwmon/hwmon1/temp2_input", "60000");
+        assert_eq!(sample().cpu_temperature(), Some(60.0));
     }
 
     #[test]

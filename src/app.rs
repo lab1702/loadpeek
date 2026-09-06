@@ -565,7 +565,7 @@ impl Loadpeek {
                                     ui,
                                     temperature(cpu_temp(s)),
                                     if cpu_temp(s).is_some() {
-                                        "Hottest reported CPU sensor"
+                                        "Hottest CPU reading · die temperature preferred"
                                     } else {
                                         "No CPU sensor exposed by this system"
                                     },
@@ -763,9 +763,10 @@ impl Loadpeek {
                             });
                         });
                         small(ui, &frequency(core.frequency_mhz));
-                        chart::show(
+                        chart::show_named(
                             ui,
                             ("core", core.id),
+                            &format!("Core {} utilization", core.id),
                             &[self.series("Use", BLUE, false, |s| {
                                 s.cores
                                     .iter()
@@ -1045,7 +1046,7 @@ impl Loadpeek {
             value(
                 ui,
                 temperature(cpu_temp(s)),
-                "Hottest CPU sensor at each sample",
+                "Hottest CPU reading at each sample · die temperature preferred",
                 PEACH,
             );
             chart::show(
@@ -1096,9 +1097,10 @@ impl Loadpeek {
                             &subtitle,
                             if critical { RED } else { PEACH },
                         );
-                        chart::show(
+                        chart::show_named(
                             ui,
                             ("sensor", &sensor.id),
+                            &format!("{} temperature", sensor.label),
                             &[self.series("Temp", PEACH, false, |s| {
                                 s.sensors
                                     .iter()
@@ -1434,12 +1436,7 @@ fn swap_percent(s: &Snapshot) -> Option<f64> {
         .then(|| s.memory.swap_used_bytes as f64 / s.memory.swap_total_bytes as f64 * 100.0)
 }
 fn cpu_temp(s: &Snapshot) -> Option<f64> {
-    s.sensors
-        .iter()
-        .filter(|s| s.is_cpu)
-        .map(|s| s.celsius)
-        .filter(|v| v.is_finite())
-        .reduce(f64::max)
+    s.cpu_temperature()
 }
 fn disk_rate(s: &Snapshot, name: &str, write: bool) -> Option<f64> {
     sum_rates(
@@ -1795,6 +1792,70 @@ mod tests {
                 }),
                 false,
             );
+        }
+    }
+
+    #[test]
+    fn device_chart_accessibility_identifies_each_core_and_sensor() {
+        use crate::metrics::{Core, Sensor};
+
+        let (mut app, _sample_tx, _commands) = test_app();
+        let snapshot = Snapshot {
+            cores: [0, 7]
+                .into_iter()
+                .map(|id| Core {
+                    id,
+                    percent: Some(42.0),
+                    frequency_mhz: Some(3200.0),
+                })
+                .collect(),
+            sensors: ["coretemp · Package 0", "coretemp · Package 1"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, label)| Sensor {
+                    id: format!("/sys/class/hwmon/hwmon{index}/temp1_input"),
+                    label: label.into(),
+                    celsius: 55.0,
+                    is_cpu: true,
+                    ..Sensor::default()
+                })
+                .collect(),
+            ..Snapshot::default()
+        };
+        app.history.push(0.0, snapshot.clone());
+
+        for (page, expected) in [
+            (Page::Cpu, ["Core 0 utilization", "Core 7 utilization"]),
+            (
+                Page::Thermals,
+                ["coretemp · Package 0", "coretemp · Package 1"],
+            ),
+        ] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            crate::theme::apply(&ctx);
+            let output = ctx.run_ui(egui::RawInput::default(), |ui| match page {
+                Page::Cpu => app.core_charts(ui, &snapshot),
+                Page::Thermals => app.thermals(ui, &snapshot),
+                _ => unreachable!(),
+            });
+            let labels: Vec<_> = output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .unwrap()
+                .nodes
+                .iter()
+                .filter(|(_, node)| node.role() == egui::accesskit::Role::Slider)
+                .filter_map(|(_, node)| node.label().map(str::to_owned))
+                .collect();
+            output.drop_without_applying_deltas();
+            for name in expected {
+                assert!(
+                    labels.iter().any(|label| label.starts_with(name)),
+                    "no history slider identifies {name}"
+                );
+            }
         }
     }
 

@@ -27,6 +27,25 @@ pub fn show(
     fixed_max: Option<f64>,
     unit: &str,
 ) {
+    let name = series
+        .iter()
+        .map(|series| series.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    show_named(ui, id, &name, series, height, fixed_max, unit);
+}
+
+/// Give the history control a descriptive accessible name while keeping the
+/// series names short in its visible legends and historical value readouts.
+pub fn show_named(
+    ui: &mut Ui,
+    id: impl Hash,
+    name: &str,
+    series: &[Series],
+    height: f32,
+    fixed_max: Option<f64>,
+    unit: &str,
+) {
     let mut id_hash = DefaultHasher::new();
     id.hash(&mut id_hash);
     ui.push_id(id_hash.finish(), |ui| {
@@ -54,7 +73,7 @@ pub fn show(
             rect.min + egui::vec2(axis_width.min(width * 0.42), 8.0),
             rect.max - egui::vec2(5.0, 24.0),
         );
-        let selected_time = inspect_history(ui, &mut response, series, plot, unit);
+        let selected_time = inspect_history(ui, &mut response, name, series, plot, unit);
         let painter = ui.painter();
         painter.rect_filled(plot.expand(5.0), 5.0, theme::BASE);
         if response.has_focus() {
@@ -215,6 +234,7 @@ pub fn show(
 fn inspect_history(
     ui: &mut Ui,
     response: &mut egui::Response,
+    name: &str,
     series: &[Series],
     plot: Rect,
     unit: &str,
@@ -308,13 +328,8 @@ fn inspect_history(
         ui.data_mut(|data| data.insert_temp(state_id, index));
     }
     let selected_time = times.get(index).copied();
-    let names = series
-        .iter()
-        .map(|series| series.name.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
     let label = format!(
-        "{names}, 60-second history. Left and Right inspect samples; Home selects oldest; End selects newest; Escape leaves the chart."
+        "{name}, 60-second history. Left and Right inspect samples; Home selects oldest; End selects newest; Escape leaves the chart."
     );
     let value = selected_time
         .map(|seconds| {
@@ -530,6 +545,99 @@ mod tests {
     }
 
     #[test]
+    fn named_charts_identify_each_control_and_preserve_series_readouts() {
+        use egui::accesskit::{Action, ActionData, ActionRequest, Role, TreeId};
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let series = [Series {
+            name: "Use".into(),
+            ..sample(vec![[-10.0, 12.0], [0.0, 42.0]])
+        }];
+        let frame = |events| {
+            ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    for core in [0, 1] {
+                        show_named(
+                            ui,
+                            ("core", core),
+                            &format!("Core {core} utilization"),
+                            &series,
+                            78.0,
+                            Some(100.0),
+                            "%",
+                        );
+                    }
+                },
+            )
+        };
+
+        let output = frame(Vec::new());
+        let nodes = &output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes;
+        let sliders: Vec<_> = nodes
+            .iter()
+            .filter(|(_, node)| node.role() == Role::Slider)
+            .collect();
+        assert_eq!(sliders.len(), 2);
+        for core in [0, 1] {
+            let prefix = format!("Core {core} utilization, 60-second history.");
+            assert!(
+                sliders
+                    .iter()
+                    .any(|(_, node)| node.label().is_some_and(|label| label.starts_with(&prefix)))
+            );
+        }
+        assert_eq!(
+            nodes
+                .iter()
+                .filter(|(_, node)| node.role() == Role::Label && node.value() == Some("Use: 42.0%"))
+                .count(),
+            2
+        );
+        let events = sliders
+            .iter()
+            .map(|(id, _)| {
+                egui::Event::AccessKitActionRequest(ActionRequest {
+                    action: Action::SetValue,
+                    target_tree: TreeId::ROOT,
+                    target_node: *id,
+                    data: Some(ActionData::NumericValue(0.0)),
+                })
+            })
+            .collect();
+        output.drop_without_applying_deltas();
+
+        let output = frame(events);
+        let sliders: Vec<_> = output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.role() == Role::Slider)
+            .collect();
+        assert_eq!(sliders.len(), 2);
+        for (_, node) in sliders {
+            assert_eq!(node.numeric_value(), Some(0.0));
+            assert_eq!(
+                node.value(),
+                Some("10.0 seconds ago. Use: 12.0% (10.0s ago)")
+            );
+        }
+        output.drop_without_applying_deltas();
+    }
+
+    #[test]
     fn tab_navigation_scrolls_focused_charts_into_view() {
         let ctx = egui::Context::default();
         theme::apply(&ctx);
@@ -633,7 +741,7 @@ mod tests {
                     if focus {
                         response.request_focus();
                     }
-                    selected = inspect_history(ui, &mut response, series, rect, "%");
+                    selected = inspect_history(ui, &mut response, "Test", series, rect, "%");
                     focused = response.has_focus();
                 },
             );

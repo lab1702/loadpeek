@@ -356,6 +356,8 @@ impl ProcessView {
         let row_stride = ROW_HEIGHT + 2.0;
         let mut focus_target = None;
         let mut scroll_target = None;
+        let mut keyboard_navigation = false;
+        let mut reveal_in_page = None;
         if let Some((key, id, previous_index)) = self.focused
             && ui.memory(|memory| memory.has_focus(id))
             && let Some(index) = processes
@@ -377,6 +379,7 @@ impl ProcessView {
                 .map(|key| navigation_target(index, processes.len(), page_rows, key))
             });
             if let Some(next) = next {
+                keyboard_navigation = true;
                 let key = ProcessKey::from(processes[next]);
                 self.selected = Some(key);
                 focus_target = Some(key);
@@ -442,6 +445,10 @@ impl ProcessView {
                                     ),
                                 )
                             });
+                            if response.gained_focus() {
+                                response.scroll_to_me(None);
+                                reveal_in_page = Some(response.rect);
+                            }
                             focus_border(ui, &response);
                             if response.clicked() {
                                 if active {
@@ -467,7 +474,8 @@ impl ProcessView {
                             (index as f32 * row_stride - table_height * 0.5).max(0.0),
                         );
                     }
-                    scroll.show_rows(ui, ROW_HEIGHT, processes.len(), |ui, range| {
+                    let mut reveal_row = None;
+                    let rows = scroll.show_rows(ui, ROW_HEIGHT, processes.len(), |ui, range| {
                         for row in range {
                             let process = processes[row];
                             let key = ProcessKey::from(process);
@@ -540,6 +548,12 @@ impl ProcessView {
                                     if response.clicked() || focus_target == Some(key) {
                                         response.request_focus();
                                     }
+                                    if response.gained_focus()
+                                        || (keyboard_navigation && focus_target == Some(key))
+                                    {
+                                        response.scroll_to_me(None);
+                                        reveal_row = Some(response.rect);
+                                    }
                                     if response.has_focus() {
                                         self.focused = Some((key, response.id, row));
                                         ui.memory_mut(|memory| {
@@ -557,8 +571,24 @@ impl ProcessView {
                             );
                         }
                     });
+                    if let Some(mut rect) = reveal_row {
+                        // The inner scroll reveals the row at its nearest edge.
+                        // Reveal that position in the page without also moving
+                        // the user's horizontal position in this wide table.
+                        let height = rect.height().min(rows.inner_rect.height());
+                        rect.min.y = rect
+                            .top()
+                            .clamp(rows.inner_rect.top(), rows.inner_rect.bottom() - height);
+                        rect.max.y = rect.min.y + height;
+                        reveal_in_page = Some(rect);
+                    }
                 });
             });
+        // Each ScrollArea consumes scroll requests, including axes it does not
+        // scroll. Forward focus visibility after both table scroll areas close.
+        if let Some(rect) = reveal_in_page {
+            ui.scroll_to_rect(rect, None);
+        }
     }
 
     fn details(&mut self, ui: &mut Ui, snapshot: &ProcessSnapshot) {
@@ -1021,6 +1051,149 @@ mod tests {
         assert_eq!(navigation_target(5, 1000, 12, egui::Key::PageUp), 0);
         assert_eq!(navigation_target(5, 1000, 12, egui::Key::End), 999);
         assert_eq!(navigation_target(999, 1000, 12, egui::Key::Home), 0);
+    }
+
+    #[test]
+    fn keyboard_focus_reveals_headers_and_rows_through_nested_scroll_areas() {
+        for size in [egui::vec2(640.0, 480.0), egui::vec2(320.0, 240.0)] {
+            let ctx = egui::Context::default();
+            crate::theme::apply(&ctx);
+            ctx.all_styles_mut(|style| {
+                style.scroll_animation = egui::style::ScrollAnimation::none();
+            });
+            let mut view = ProcessView::default();
+            let mut snapshot = ProcessSnapshot {
+                processes: (1..=100).map(|pid| process(pid, Some(0.0))).collect(),
+                warnings: vec![],
+            };
+            let key_event = |key| egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let frame = |view: &mut ProcessView, snapshot: &ProcessSnapshot, events| {
+                let output = ctx.run_ui(
+                    egui::RawInput {
+                        events,
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("process_test_page")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                // Model the app header above the process view.
+                                ui.add_space(150.0);
+                                view.show(ui, snapshot);
+                            });
+                    },
+                );
+                output.drop_without_applying_deltas();
+            };
+            frame(&mut view, &snapshot, vec![]);
+            frame(&mut view, &snapshot, vec![]);
+            // Search, state, all twelve headers, and several process rows.
+            for tab in 0..22 {
+                frame(&mut view, &snapshot, vec![key_event(egui::Key::Tab)]);
+                for _ in 0..4 {
+                    frame(&mut view, &snapshot, vec![]);
+                }
+                if tab < 2 {
+                    continue;
+                }
+                let response = ctx
+                    .read_response(ctx.memory(|memory| memory.focused()).unwrap())
+                    .unwrap();
+                assert!(
+                    response.interact_rect.top() <= response.rect.top() + 1.0
+                        && response.interact_rect.bottom() >= response.rect.bottom() - 1.0,
+                    "{size:?}, tab {tab}: focused {:?}, visible {:?}",
+                    response.rect,
+                    response.interact_rect,
+                );
+                if tab < 14 {
+                    assert!(
+                        response.interact_rect.left() <= response.rect.left() + 1.0
+                            && response.interact_rect.right() >= response.rect.right() - 1.0,
+                        "{size:?}, tab {tab}: focused {:?}, visible {:?}",
+                        response.rect,
+                        response.interact_rect,
+                    );
+                }
+            }
+            let horizontal_position = ctx
+                .read_response(ctx.memory(|memory| memory.focused()).unwrap())
+                .unwrap()
+                .rect
+                .left();
+            for key in [egui::Key::End, egui::Key::Home, egui::Key::PageDown] {
+                frame(&mut view, &snapshot, vec![key_event(key)]);
+                for _ in 0..4 {
+                    frame(&mut view, &snapshot, vec![]);
+                }
+                let response = ctx
+                    .read_response(ctx.memory(|memory| memory.focused()).unwrap())
+                    .unwrap();
+                assert!(
+                    response.interact_rect.top() <= response.rect.top() + 1.0
+                        && response.interact_rect.bottom() >= response.rect.bottom() - 1.0,
+                    "{size:?}, {key:?}: focused {:?}, visible {:?}",
+                    response.rect,
+                    response.interact_rect,
+                );
+                assert_eq!(response.rect.left(), horizontal_position);
+            }
+            // An intentional horizontal wheel scroll must survive later frames,
+            // keyboard movement, and a live CPU sort that moves the same process.
+            let response = ctx
+                .read_response(ctx.memory(|memory| memory.focused()).unwrap())
+                .unwrap();
+            frame(
+                &mut view,
+                &snapshot,
+                vec![
+                    egui::Event::PointerMoved(response.interact_rect.center()),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(100.0, 0.0),
+                        phase: egui::TouchPhase::Move,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            for _ in 0..20 {
+                frame(&mut view, &snapshot, vec![]);
+            }
+            let scrolled = ctx
+                .read_response(ctx.memory(|memory| memory.focused()).unwrap())
+                .unwrap()
+                .rect
+                .left();
+            assert!(scrolled > horizontal_position + 50.0);
+            let selected = view.selected.unwrap();
+            snapshot
+                .processes
+                .iter_mut()
+                .find(|process| ProcessKey::from(&**process) == selected)
+                .unwrap()
+                .cpu_percent = Some(100.0);
+            for _ in 0..4 {
+                frame(&mut view, &snapshot, vec![]);
+            }
+            assert_eq!(view.focused.unwrap().0, selected);
+            assert_eq!(view.focused.unwrap().2, 0);
+            frame(&mut view, &snapshot, vec![key_event(egui::Key::ArrowDown)]);
+            for _ in 0..4 {
+                frame(&mut view, &snapshot, vec![]);
+            }
+            let response = ctx
+                .read_response(ctx.memory(|memory| memory.focused()).unwrap())
+                .unwrap();
+            assert_eq!(response.rect.left(), scrolled);
+        }
     }
 
     #[test]
