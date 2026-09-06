@@ -78,8 +78,8 @@ impl Column {
         }
     }
 
-    fn width(self) -> f32 {
-        match self {
+    fn width(self, ui: &Ui, processes: &[&Process]) -> f32 {
+        let minimum: f32 = match self {
             Self::Pid => 82.0,
             Self::User => 80.0,
             Self::Priority | Self::Nice => 42.0,
@@ -89,7 +89,24 @@ impl Column {
             Self::Memory => 64.0,
             Self::CpuTime => 86.0,
             Self::Command => 210.0,
+        };
+        if !matches!(self, Self::Priority | Self::Cpu | Self::CpuTime) {
+            return minimum;
         }
+        // These numeric fields can outgrow their usual widths. Include offscreen
+        // rows so scrolling never changes the column boundaries. All values use
+        // the same monospace font, so only the longest string needs shaping.
+        let longest = processes
+            .iter()
+            .map(|process| self.value(process))
+            .max_by_key(String::len)
+            .unwrap_or_default();
+        let text_width = ui
+            .painter()
+            .layout_no_wrap(longest, FontId::monospace(13.0), TEXT)
+            .size()
+            .x;
+        minimum.max((text_width + CELL_PADDING * 2.0 + 1.0).ceil())
     }
 
     fn initial_descending(self) -> bool {
@@ -361,9 +378,14 @@ impl ProcessView {
     fn table(&mut self, ui: &mut Ui, processes: &[&Process], filters_changed: bool) {
         // Only visible rows are instantiated, and their identities follow the process,
         // not the current sort position. Both axes retain native scrollbars.
-        let minimum_width: f32 = Column::ALL.iter().map(|column| column.width()).sum();
+        let mut columns = Column::ALL.map(|column| (column, column.width(ui, processes)));
+        let minimum_width: f32 = columns.iter().map(|(_, width)| width).sum();
         let table_width = ui.available_width().max(minimum_width);
-        let command_width = Column::Command.width() + table_width - minimum_width;
+        for (column, width) in &mut columns {
+            if *column == Column::Command {
+                *width += table_width - minimum_width;
+            }
+        }
         let viewport_height = ui.ctx().content_rect().height();
         let table_height = (viewport_height - 570.0).clamp(240.0, 430.0);
         let row_stride = ROW_HEIGHT + 2.0;
@@ -414,12 +436,7 @@ impl ProcessView {
                     ui.spacing_mut().button_padding = Vec2::new(CELL_PADDING, 4.0);
                     ui.spacing_mut().interact_size.y = ROW_HEIGHT;
                     ui.horizontal(|ui| {
-                        for column in Column::ALL {
-                            let width = if column == Column::Command {
-                                command_width
-                            } else {
-                                column.width()
-                            };
+                        for &(column, width) in &columns {
                             let active = self.sort == column;
                             let arrow = if active {
                                 if self.descending { " ↓" } else { " ↑" }
@@ -500,12 +517,8 @@ impl ProcessView {
                                 ))),
                                 |ui| {
                                     let mut atoms = egui::Atoms::new(());
-                                    for column in Column::ALL {
-                                        let width = if column == Column::Command {
-                                            command_width
-                                        } else {
-                                            column.width()
-                                        } - CELL_PADDING * 2.0;
+                                    for &(column, width) in &columns {
+                                        let width = width - CELL_PADDING * 2.0;
                                         let align = match column {
                                             Column::User | Column::Command => Align2::LEFT_CENTER,
                                             Column::State => Align2::CENTER_CENTER,
@@ -1372,6 +1385,155 @@ mod tests {
                 }
             }
             assert_eq!(seen, [true; 6], "{size:?}: memory cells were unreachable");
+        }
+    }
+
+    #[test]
+    fn numeric_cells_keep_complete_values_at_supported_sizes() {
+        let expected = ["-100", "12800.0", "1000:00:00"];
+        let mut process = process(1, Some(12800.0));
+        process.priority = -100;
+        process.cpu_time_secs = 1000.0 * 3600.0;
+        let rows = [&process];
+        for size in [
+            egui::vec2(320.0, 240.0),
+            egui::vec2(640.0, 480.0),
+            egui::vec2(1440.0, 1000.0),
+        ] {
+            let ctx = egui::Context::default();
+            crate::theme::apply(&ctx);
+            ctx.all_styles_mut(|style| {
+                style.scroll_animation = egui::style::ScrollAnimation::none();
+            });
+            let mut view = ProcessView::default();
+            let mut seen = [false; 3];
+            for frame in 0..48 {
+                // Tab through the headers to reveal numeric columns in narrow windows.
+                let events = if frame >= 4 && frame % 4 == 0 {
+                    vec![egui::Event::Key {
+                        key: egui::Key::Tab,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }]
+                } else {
+                    vec![]
+                };
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| view.table(ui, &rows, false),
+                );
+                // Release renderer deltas before assertions so failures unwind cleanly.
+                output.textures_delta.clear();
+                for clipped in &output.shapes {
+                    let egui::Shape::Text(text) = &clipped.shape else {
+                        continue;
+                    };
+                    let Some(index) = expected
+                        .iter()
+                        .position(|value| *value == text.galley.job.text)
+                    else {
+                        continue;
+                    };
+                    let rect = text.galley.rect.translate(text.pos.to_vec2());
+                    if !clipped.clip_rect.contains_rect(rect) {
+                        continue;
+                    }
+                    assert!(
+                        !text.galley.elided,
+                        "{size:?}: {} is truncated",
+                        expected[index]
+                    );
+                    assert_eq!(text.galley.rows.len(), 1);
+                    let painted: String = text.galley.rows[0]
+                        .glyphs
+                        .iter()
+                        .map(|glyph| glyph.chr)
+                        .collect();
+                    assert_eq!(painted, expected[index], "{size:?}: numeric text changed");
+                    seen[index] = true;
+                }
+                output.drop_without_applying_deltas();
+                if seen.iter().all(|visible| *visible) {
+                    break;
+                }
+            }
+            assert_eq!(seen, [true; 3], "{size:?}: numeric cells were unreachable");
+        }
+    }
+
+    #[test]
+    fn numeric_column_widths_account_for_initially_virtualized_rows() {
+        let mut processes: Vec<_> = (1..=100).map(|pid| process(pid, Some(0.0))).collect();
+        let last = processes.last_mut().unwrap();
+        last.priority = -100;
+        last.cpu_percent = Some(12800.0);
+        last.cpu_time_secs = 1000.0 * 3600.0;
+        let rows: Vec<_> = processes.iter().collect();
+        for size in [
+            egui::vec2(320.0, 240.0),
+            egui::vec2(640.0, 480.0),
+            egui::vec2(1440.0, 1000.0),
+        ] {
+            let ctx = egui::Context::default();
+            crate::theme::apply(&ctx);
+            ctx.all_styles_mut(|style| {
+                style.scroll_animation = egui::style::ScrollAnimation::none();
+            });
+            let mut view = ProcessView::default();
+            let frame = |view: &mut ProcessView, key: Option<egui::Key>| {
+                let output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                        events: key
+                            .into_iter()
+                            .map(|key| egui::Event::Key {
+                                key,
+                                physical_key: None,
+                                pressed: true,
+                                repeat: false,
+                                modifiers: egui::Modifiers::NONE,
+                            })
+                            .collect(),
+                        ..Default::default()
+                    },
+                    |ui| view.table(ui, &rows, false),
+                );
+                output.drop_without_applying_deltas();
+            };
+            for _ in 0..4 {
+                frame(&mut view, None);
+            }
+            let mut headers = vec![];
+            // Visit all headers, then the first process row.
+            for tab in 0..13 {
+                frame(&mut view, Some(egui::Key::Tab));
+                for _ in 0..4 {
+                    frame(&mut view, None);
+                }
+                if [2, 8, 10].contains(&tab) {
+                    let id = ctx.memory(|memory| memory.focused()).unwrap();
+                    headers.push((id, ctx.read_response(id).unwrap().rect.width()));
+                }
+            }
+            assert_eq!(view.focused.unwrap().2, 0);
+            frame(&mut view, Some(egui::Key::End));
+            for _ in 0..4 {
+                frame(&mut view, None);
+            }
+            assert_eq!(view.focused.unwrap().2, 99);
+            for (id, initial_width) in headers {
+                let width = ctx.read_response(id).unwrap().rect.width();
+                assert!(
+                    (width - initial_width).abs() < 0.01,
+                    "{size:?}: numeric column width changed from {initial_width} to {width} when a long value became visible",
+                );
+            }
         }
     }
 
