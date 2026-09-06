@@ -212,6 +212,7 @@ pub struct ProcessView {
     descending: bool,
     selected: Option<ProcessKey>,
     focused: Option<(ProcessKey, egui::Id, usize)>,
+    viewport_size: Option<Vec2>,
 }
 
 impl Default for ProcessView {
@@ -223,6 +224,7 @@ impl Default for ProcessView {
             descending: true,
             selected: None,
             focused: None,
+            viewport_size: None,
         }
     }
 }
@@ -396,12 +398,16 @@ impl ProcessView {
                 *width += table_width - minimum_width;
             }
         }
-        let viewport_height = ui.ctx().content_rect().height();
-        let table_height = (viewport_height - 570.0).clamp(240.0, 430.0);
+        let viewport_size = ui.ctx().content_rect().size();
+        let viewport_resized = self
+            .viewport_size
+            .replace(viewport_size)
+            .is_some_and(|previous| previous != viewport_size);
+        let table_height = (viewport_size.y - 570.0).clamp(240.0, 430.0);
         let row_stride = ROW_HEIGHT + 2.0;
         let mut focus_target = None;
         let mut scroll_target = None;
-        let mut keyboard_navigation = false;
+        let mut reveal_focus = false;
         let mut reveal_in_page = None;
         if let Some((key, id, previous_index)) = self.focused
             && ui.memory(|memory| memory.has_focus(id))
@@ -426,19 +432,21 @@ impl ProcessView {
                 .map(|key| navigation_target(index, processes.len(), page_rows, key))
             });
             if let Some(next) = next {
-                keyboard_navigation = true;
+                reveal_focus = true;
                 let key = ProcessKey::from(processes[next]);
                 self.selected = Some(key);
                 focus_target = Some(key);
                 scroll_target = Some(next);
-            } else if (current_index.is_none() || index != previous_index)
+            } else if (current_index.is_none() || index != previous_index || viewport_resized)
                 && !explicit_focus_input(ui)
             {
-                // A live sort can move the focused process outside the instantiated
-                // rows. Follow its identity, or the nearest surviving row if it
-                // exited or left the filter. Focus recovery preserves selection.
+                // Sorting or resizing can move the focused process outside the
+                // instantiated rows. Follow its identity, or the nearest survivor
+                // after an exit/filter change, without changing selection. Reveal
+                // resized layouts once, allowing later manual scrolling.
                 focus_target = Some(ProcessKey::from(processes[index]));
                 scroll_target = Some(index);
+                reveal_focus = viewport_resized;
             }
         }
         egui::ScrollArea::horizontal()
@@ -590,7 +598,7 @@ impl ProcessView {
                                         response.request_focus();
                                     }
                                     if response.gained_focus()
-                                        || (keyboard_navigation && focus_target == Some(key))
+                                        || (reveal_focus && focus_target == Some(key))
                                     {
                                         response.scroll_to_me(None);
                                         reveal_row = Some(response.rect);

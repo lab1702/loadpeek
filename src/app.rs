@@ -1622,6 +1622,130 @@ mod tests {
     }
 
     #[test]
+    fn process_keyboard_focus_survives_window_resize() {
+        let original_size = egui::vec2(1440.0, 1000.0);
+        for size in [
+            egui::vec2(1440.0, 800.0),
+            egui::vec2(640.0, 480.0),
+            egui::vec2(320.0, 240.0),
+        ] {
+            let (mut app, _samples, _commands) = test_app();
+            app.page = Page::Processes;
+            app.processes.processes = (1..=100)
+                .map(|pid| crate::processes::Process {
+                    pid,
+                    ppid: 1,
+                    uid: Some(1000),
+                    user: "alice".into(),
+                    state: 'S',
+                    priority: 20,
+                    nice: 0,
+                    threads: 1,
+                    virtual_bytes: Some(2048),
+                    resident_bytes: Some(1024),
+                    shared_bytes: Some(512),
+                    cpu_percent: Some(0.0),
+                    memory_percent: Some(1.0),
+                    cpu_time_secs: 125.12,
+                    elapsed_secs: Some(900.0),
+                    name: "worker".into(),
+                    command: "worker --serve".into(),
+                    start_time_ticks: 100,
+                })
+                .collect();
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            crate::theme::apply(&ctx);
+            ctx.all_styles_mut(|style| {
+                style.scroll_animation = egui::style::ScrollAnimation::none();
+            });
+            let key_event = |key| egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let mut frame = |size, events| {
+                let output = ctx.run_ui(
+                    egui::RawInput {
+                        events,
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                        ..Default::default()
+                    },
+                    |ui| app.ui(ui, &mut eframe::Frame::_new_kittest()),
+                );
+                let focused = ctx.memory(|memory| memory.focused()).and_then(|id| {
+                    let response = ctx.read_response(id)?;
+                    let (_, node) = output
+                        .platform_output
+                        .accesskit_update
+                        .as_ref()?
+                        .nodes
+                        .iter()
+                        .find(|(node_id, _)| *node_id == id.accesskit_id())?;
+                    Some((
+                        response,
+                        node.label().unwrap_or_default().to_owned(),
+                        node.toggled(),
+                    ))
+                });
+                output.drop_without_applying_deltas();
+                focused
+            };
+            for _ in 0..4 {
+                frame(original_size, vec![]);
+            }
+            let mut original_row = None;
+            for _ in 0..60 {
+                frame(original_size, vec![key_event(egui::Key::Tab)]);
+                for _ in 0..4 {
+                    frame(original_size, vec![]);
+                }
+                let Some((response, label, _)) = frame(original_size, vec![]) else {
+                    continue;
+                };
+                if label.starts_with("PID 12,") {
+                    original_row = Some(response);
+                    break;
+                }
+            }
+            let original_row = original_row.expect("Tab should reach process 12");
+
+            // Row 12 fits at the default size, but shrinking the table would
+            // virtualize it unless resize recovery reveals its original identity.
+            for _ in 0..5 {
+                frame(size, vec![]);
+            }
+            let (resized, _, _) = frame(size, vec![])
+                .unwrap_or_else(|| panic!("{size:?}: resizing lost process focus"));
+            assert_eq!(resized.id, original_row.id);
+            assert!(
+                resized.interact_rect.top() <= resized.rect.top() + 1.0
+                    && resized.interact_rect.bottom() >= resized.rect.bottom() - 1.0,
+                "{size:?}: resized row {:?} is outside {:?}",
+                resized.rect,
+                resized.interact_rect,
+            );
+
+            frame(size, vec![key_event(egui::Key::ArrowDown)]);
+            for _ in 0..4 {
+                frame(size, vec![]);
+            }
+            let (next, label, selected) = frame(size, vec![]).unwrap();
+            assert!(label.starts_with("PID 13,"), "{size:?}: {label}");
+            assert_eq!(selected, Some(egui::accesskit::Toggled::True));
+            assert!(
+                next.interact_rect.top() <= next.rect.top() + 1.0
+                    && next.interact_rect.bottom() >= next.rect.bottom() - 1.0,
+                "{size:?}: next row {:?} is outside {:?}",
+                next.rect,
+                next.interact_rect,
+            );
+        }
+    }
+
+    #[test]
     fn keyboard_focus_reveals_page_controls_after_scrolling() {
         use egui::accesskit::Role;
         use std::collections::HashSet;
