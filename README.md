@@ -4,6 +4,16 @@ A native Linux system monitor written in Rust, with a [Catppuccin Mocha](https:/
 
 ![Loadpeek Summary dashboard in Catppuccin Mocha showing CPU, memory, disk, network, thermals, and system load.](docs/images/summary.png)
 
+## Install from the main branch
+
+With **Rust 1.95 or newer** and Cargo installed, plus the [Linux dependencies](#linux-dependencies), install directly from GitHub:
+
+```sh
+cargo install --git https://github.com/lab1702/loadpeek --branch main --locked
+```
+
+Cargo builds Loadpeek from source and installs it to `~/.cargo/bin` by default. Ensure that directory is on your `PATH`, then run `loadpeek` in a Linux desktop session. Run the same install command again to update to the latest code on `main`.
+
 ## Build and run
 
 Use **Rust 1.95 or newer** with Cargo, a C compiler/linker, and a Linux desktop session. The GUI uses egui/eframe with the Glow OpenGL renderer and both X11 and Wayland support.
