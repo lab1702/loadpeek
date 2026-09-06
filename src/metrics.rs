@@ -25,6 +25,36 @@ pub struct Snapshot {
     pub warnings: Vec<String>,
 }
 
+impl Snapshot {
+    /// Clock statistics across cores with a valid reading in this sample.
+    pub fn cpu_frequency_stats(&self) -> Option<FrequencyStats> {
+        let mut frequencies = self
+            .cores
+            .iter()
+            .filter_map(|core| core.frequency_mhz)
+            .filter(|frequency| frequency.is_finite() && *frequency > 0.0);
+        let first = frequencies.next()?;
+        let mut stats = FrequencyStats {
+            min_mhz: first,
+            average_mhz: first,
+            max_mhz: first,
+        };
+        for (index, frequency) in frequencies.enumerate() {
+            stats.min_mhz = stats.min_mhz.min(frequency);
+            stats.average_mhz += (frequency - stats.average_mhz) / (index + 2) as f64;
+            stats.max_mhz = stats.max_mhz.max(frequency);
+        }
+        Some(stats)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FrequencyStats {
+    pub min_mhz: f64,
+    pub average_mhz: f64,
+    pub max_mhz: f64,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Core {
     pub id: usize,
@@ -731,6 +761,82 @@ fn discover_sensors(sys_root: &Path, warnings: &mut Vec<String>) -> Vec<Sensor> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn frequency_snapshot(frequencies: &[Option<f64>]) -> Snapshot {
+        Snapshot {
+            cores: frequencies
+                .iter()
+                .enumerate()
+                .map(|(id, &frequency_mhz)| Core {
+                    id,
+                    frequency_mhz,
+                    ..Core::default()
+                })
+                .collect(),
+            ..Snapshot::default()
+        }
+    }
+
+    #[test]
+    fn cpu_frequency_stats_include_minimum_average_and_maximum() {
+        let snapshot = frequency_snapshot(&[Some(3200.0), Some(800.0), Some(2000.0)]);
+        assert_eq!(
+            snapshot.cpu_frequency_stats(),
+            Some(FrequencyStats {
+                min_mhz: 800.0,
+                average_mhz: 2000.0,
+                max_mhz: 3200.0,
+            })
+        );
+    }
+
+    #[test]
+    fn cpu_frequency_stats_ignore_missing_and_invalid_readings() {
+        let snapshot = frequency_snapshot(&[
+            None,
+            Some(900.0),
+            Some(f64::NAN),
+            Some(0.0),
+            Some(-100.0),
+            Some(f64::INFINITY),
+            Some(f64::NEG_INFINITY),
+            Some(2700.0),
+        ]);
+        assert_eq!(
+            snapshot.cpu_frequency_stats(),
+            Some(FrequencyStats {
+                min_mhz: 900.0,
+                average_mhz: 1800.0,
+                max_mhz: 2700.0,
+            })
+        );
+    }
+
+    #[test]
+    fn cpu_frequency_stats_match_the_only_available_core() {
+        let snapshot = frequency_snapshot(&[None, Some(2400.5), None]);
+        assert_eq!(
+            snapshot.cpu_frequency_stats(),
+            Some(FrequencyStats {
+                min_mhz: 2400.5,
+                average_mhz: 2400.5,
+                max_mhz: 2400.5,
+            })
+        );
+    }
+
+    #[test]
+    fn cpu_frequency_stats_are_missing_without_valid_readings() {
+        assert_eq!(Snapshot::default().cpu_frequency_stats(), None);
+        assert_eq!(
+            frequency_snapshot(&[None, None]).cpu_frequency_stats(),
+            None
+        );
+        assert_eq!(
+            frequency_snapshot(&[Some(0.0), Some(-1.0), Some(f64::NAN)]).cpu_frequency_stats(),
+            None
+        );
+    }
 
     #[test]
     fn cpu_guest_time_is_not_counted_twice() {

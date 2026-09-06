@@ -11,7 +11,7 @@ use eframe::egui::{
 use crate::{
     chart::{self, Series},
     history::History,
-    metrics::{Collector, Snapshot},
+    metrics::{Collector, FrequencyStats, Snapshot},
     process_view::ProcessView,
     processes::{ProcessCollector, ProcessSnapshot},
     settings::Settings,
@@ -465,9 +465,9 @@ impl Loadpeek {
                                     ui,
                                     percent(s.cpu_percent),
                                     &format!(
-                                        "{} logical cores  ·  {}",
+                                        "{} logical cores\n{}",
                                         s.cores.len(),
-                                        frequency(cpu_frequency(s))
+                                        frequency_summary(s.cpu_frequency_stats())
                                     ),
                                     BLUE,
                                 );
@@ -672,16 +672,23 @@ impl Loadpeek {
                     );
                 } else {
                     heading(ui, "Clock speed", LAVENDER);
-                    value(
-                        ui,
-                        frequency(cpu_frequency(s)),
-                        "Mean of available logical core frequencies",
-                        LAVENDER,
-                    );
+                    frequency_values(ui, s.cpu_frequency_stats());
+                    small(ui, "Across available logical core frequencies");
+                    ui.add_space(9.0);
                     chart::show(
                         ui,
                         "cpu_clock",
-                        &[self.series("Clock", LAVENDER, false, cpu_frequency)],
+                        &[
+                            self.series("Min", TEAL, true, |s| {
+                                s.cpu_frequency_stats().map(|f| f.min_mhz)
+                            }),
+                            self.series("Average", LAVENDER, false, |s| {
+                                s.cpu_frequency_stats().map(|f| f.average_mhz)
+                            }),
+                            self.series("Max", PEACH, true, |s| {
+                                s.cpu_frequency_stats().map(|f| f.max_mhz)
+                            }),
+                        ],
                         180.0,
                         None,
                         "MHz",
@@ -1346,6 +1353,46 @@ fn paired_values(
     });
     ui.add_space(9.0);
 }
+fn frequency_values(ui: &mut Ui, stats: Option<FrequencyStats>) {
+    let Some(stats) = stats else {
+        ui.label(
+            RichText::new("Clock unavailable")
+                .size(25.0)
+                .color(LAVENDER),
+        );
+        return;
+    };
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 20.0;
+        for (label, reading, color) in [
+            ("Min", stats.min_mhz, TEAL),
+            ("Average", stats.average_mhz, LAVENDER),
+            ("Max", stats.max_mhz, PEACH),
+        ] {
+            let mut text = egui::text::LayoutJob::default();
+            text.append(
+                &frequency(Some(reading)),
+                0.0,
+                egui::TextFormat {
+                    font_id: FontId::proportional(25.0),
+                    color,
+                    ..Default::default()
+                },
+            );
+            text.append(
+                &format!("\n{label}"),
+                0.0,
+                egui::TextFormat {
+                    font_id: FontId::proportional(12.0),
+                    color: SUBTEXT,
+                    ..Default::default()
+                },
+            );
+            // Wrap each value and its label together, keeping the GHz unit intact.
+            ui.add(egui::Label::new(text).extend());
+        }
+    });
+}
 fn metric_row(ui: &mut Ui, label: &str, value: String) {
     if ui.available_width() < 420.0 {
         ui.label(RichText::new(label).color(SUBTEXT));
@@ -1385,15 +1432,6 @@ fn memory_percent(s: &Snapshot) -> Option<f64> {
 fn swap_percent(s: &Snapshot) -> Option<f64> {
     (s.memory.swap_total_bytes > 0)
         .then(|| s.memory.swap_used_bytes as f64 / s.memory.swap_total_bytes as f64 * 100.0)
-}
-fn cpu_frequency(s: &Snapshot) -> Option<f64> {
-    let frequencies: Vec<_> = s
-        .cores
-        .iter()
-        .filter_map(|c| c.frequency_mhz)
-        .filter(|f| f.is_finite())
-        .collect();
-    (!frequencies.is_empty()).then(|| frequencies.iter().sum::<f64>() / frequencies.len() as f64)
 }
 fn cpu_temp(s: &Snapshot) -> Option<f64> {
     s.sensors
@@ -1455,6 +1493,18 @@ fn percent(value: Option<f64>) -> String {
 fn frequency(value: Option<f64>) -> String {
     value
         .map(|v| format!("{:.2} GHz", v / 1000.0))
+        .unwrap_or_else(|| "Clock unavailable".into())
+}
+fn frequency_summary(stats: Option<FrequencyStats>) -> String {
+    stats
+        .map(|f| {
+            format!(
+                "Min {:.2} · Avg {:.2} · Max {:.2} GHz",
+                f.min_mhz / 1000.0,
+                f.average_mhz / 1000.0,
+                f.max_mhz / 1000.0,
+            )
+        })
         .unwrap_or_else(|| "Clock unavailable".into())
 }
 fn temperature(value: Option<f64>) -> String {

@@ -41,8 +41,8 @@ For runtime troubleshooting, Debian provides [libgl1](https://packages.debian.or
 
 | Page | What it shows |
 | --- | --- |
-| **Summary** | The first page: CPU utilization and average clock, RAM usage, disk read/write, network in/out, CPU temperature, load averages, and uptime. Each card opens its detail page. |
-| **CPU** | Overall utilization, average clock history, 1/5/15-minute load averages, and a utilization chart plus current clock for every online logical core. A core filter helps on large systems. |
+| **Summary** | The first page: CPU utilization and minimum/average/maximum clock, RAM usage, disk read/write, network in/out, CPU temperature, load averages, and uptime. Each card opens its detail page. |
+| **CPU** | Overall utilization, minimum/average/maximum clock history, 1/5/15-minute load averages, and a utilization chart plus current clock for every online logical core. A core filter helps on large systems. |
 | **Memory** | RAM and swap utilization histories, total memory, available memory, used memory, and reclaimable cache. |
 | **Disk** | Combined or selected-device read/write history, current rates, and lifetime counters for each detected whole leaf block device. |
 | **Network** | Combined or selected-interface incoming/outgoing history, current rates, interface state, and lifetime byte counters. |
@@ -100,7 +100,7 @@ CPU percentages use differences between `/proc/stat` samples. The overall value 
 
 Load averages are the kernel's 1-, 5-, and 15-minute averages of runnable or uninterruptible tasks, read from `/proc/loadavg`. They are task counts, not CPU percentages. Compare them with the number of logical cores, while remembering that I/O waits also contribute. Uptime comes from `/proc/uptime`.
 
-Clock readings prefer `cpuinfo_cur_freq`, then `scaling_cur_freq`, then `/proc/cpuinfo`'s `cpu MHz`. The displayed average includes only cores with an available reading. A scaling-driver reading may describe its requested frequency rather than the exact instantaneous hardware clock; availability and meaning depend on the driver. See [CPU performance scaling](https://docs.kernel.org/admin-guide/pm/cpufreq.html).
+Clock readings prefer `cpuinfo_cur_freq`, then `scaling_cur_freq`, then `/proc/cpuinfo`'s `cpu MHz`. The CPU minimum, average, and maximum are calculated across cores with an available, finite, positive reading in each sample. Clock history tracks all three statistics for each sample. Individual core readouts show that core's current frequency. A scaling-driver reading may describe its requested frequency rather than the exact instantaneous hardware clock; availability and meaning depend on the driver. See [CPU performance scaling](https://docs.kernel.org/admin-guide/pm/cpufreq.html).
 
 ### Memory
 
