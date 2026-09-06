@@ -224,17 +224,20 @@ impl ProcessView {
                 let mut filters_changed = false;
                 ui.horizontal_wrapped(|ui| {
                     let search_label = ui.label("Search");
-                    filters_changed |= ui
+                    let search = ui
                         .add(
                             egui::TextEdit::singleline(&mut self.query)
                                 .id_salt("process_search")
                                 .hint_text("PID, user, name, or command")
                                 .desired_width(270.0),
                         )
-                        .labelled_by(search_label.id)
-                        .changed();
+                        .labelled_by(search_label.id);
+                    filters_changed |= search.changed();
+                    if search.gained_focus() {
+                        search.scroll_to_me(None);
+                    }
                     let state_label = ui.label("State");
-                    egui::ComboBox::from_id_salt("process_state")
+                    let state = egui::ComboBox::from_id_salt("process_state")
                         .selected_text(self.state.title())
                         .show_ui(ui, |ui| {
                             for state in StateFilter::ALL {
@@ -245,12 +248,19 @@ impl ProcessView {
                         })
                         .response
                         .labelled_by(state_label.id);
-                    if (!self.query.is_empty() || self.state != StateFilter::All)
-                        && ui.button("Clear filters").clicked()
-                    {
-                        self.query.clear();
-                        self.state = StateFilter::All;
-                        filters_changed = true;
+                    if state.gained_focus() {
+                        state.scroll_to_me(None);
+                    }
+                    if !self.query.is_empty() || self.state != StateFilter::All {
+                        let clear = ui.button("Clear filters");
+                        if clear.gained_focus() {
+                            clear.scroll_to_me(None);
+                        }
+                        if clear.clicked() {
+                            self.query.clear();
+                            self.state = StateFilter::All;
+                            filters_changed = true;
+                        }
                     }
                 });
 
@@ -295,7 +305,7 @@ impl ProcessView {
                     "Memory uses binary units. TIME+ is accumulated CPU time. — means unavailable or awaiting a second sample.",
                 );
                 if !snapshot.warnings.is_empty() {
-                    egui::CollapsingHeader::new(
+                    let notices = egui::CollapsingHeader::new(
                         RichText::new(format!(
                             "{} process availability notices",
                             snapshot.warnings.len()
@@ -308,6 +318,9 @@ impl ProcessView {
                             ui.label(warning);
                         }
                     });
+                    if notices.header_response.gained_focus() {
+                        notices.header_response.scroll_to_me(None);
+                    }
                 }
             });
         ui.add_space(12.0);
@@ -609,7 +622,11 @@ impl ProcessView {
                             .strong()
                             .color(BLUE),
                     );
-                    if ui.button("Clear selection").clicked() {
+                    let clear = ui.button("Clear selection");
+                    if clear.gained_focus() {
+                        clear.scroll_to_me(None);
+                    }
+                    if clear.clicked() {
                         self.selected = None;
                     }
                 });
@@ -1054,17 +1071,20 @@ mod tests {
     }
 
     #[test]
-    fn keyboard_focus_reveals_headers_and_rows_through_nested_scroll_areas() {
+    fn keyboard_focus_reveals_filters_headers_rows_and_details() {
         for size in [egui::vec2(640.0, 480.0), egui::vec2(320.0, 240.0)] {
             let ctx = egui::Context::default();
             crate::theme::apply(&ctx);
             ctx.all_styles_mut(|style| {
                 style.scroll_animation = egui::style::ScrollAnimation::none();
             });
-            let mut view = ProcessView::default();
+            let mut view = ProcessView {
+                query: "worker".into(),
+                ..Default::default()
+            };
             let mut snapshot = ProcessSnapshot {
                 processes: (1..=100).map(|pid| process(pid, Some(0.0))).collect(),
-                warnings: vec![],
+                warnings: vec!["Some process details are unavailable.".into()],
             };
             let key_event = |key| egui::Event::Key {
                 key,
@@ -1095,14 +1115,11 @@ mod tests {
             };
             frame(&mut view, &snapshot, vec![]);
             frame(&mut view, &snapshot, vec![]);
-            // Search, state, all twelve headers, and several process rows.
-            for tab in 0..22 {
+            // Search, state, Clear filters, all twelve headers, and several rows.
+            for tab in 0..23 {
                 frame(&mut view, &snapshot, vec![key_event(egui::Key::Tab)]);
                 for _ in 0..4 {
                     frame(&mut view, &snapshot, vec![]);
-                }
-                if tab < 2 {
-                    continue;
                 }
                 let response = ctx
                     .read_response(ctx.memory(|memory| memory.focused()).unwrap())
@@ -1114,7 +1131,7 @@ mod tests {
                     response.rect,
                     response.interact_rect,
                 );
-                if tab < 14 {
+                if tab < 15 {
                     assert!(
                         response.interact_rect.left() <= response.rect.left() + 1.0
                             && response.interact_rect.right() >= response.rect.right() - 1.0,
@@ -1193,6 +1210,66 @@ mod tests {
                 .read_response(ctx.memory(|memory| memory.focused()).unwrap())
                 .unwrap();
             assert_eq!(response.rect.left(), scrolled);
+
+            // From the final process row, Tab reaches the notices header and
+            // then Clear selection. Both must reveal themselves in the page.
+            frame(&mut view, &snapshot, vec![key_event(egui::Key::End)]);
+            for _ in 0..4 {
+                frame(&mut view, &snapshot, vec![]);
+            }
+            frame(&mut view, &snapshot, vec![key_event(egui::Key::Tab)]);
+            for _ in 0..4 {
+                frame(&mut view, &snapshot, vec![]);
+            }
+            let notices = ctx
+                .read_response(ctx.memory(|memory| memory.focused()).unwrap())
+                .unwrap();
+            assert_ne!(notices.id, view.focused.unwrap().1);
+            assert!(
+                notices.interact_rect.top() <= notices.rect.top() + 1.0
+                    && notices.interact_rect.bottom() >= notices.rect.bottom() - 1.0,
+                "{size:?}, Process notices: focused {:?}, visible {:?}",
+                notices.rect,
+                notices.interact_rect,
+            );
+            frame(&mut view, &snapshot, vec![key_event(egui::Key::Tab)]);
+            for _ in 0..4 {
+                frame(&mut view, &snapshot, vec![]);
+            }
+            let response = ctx
+                .read_response(ctx.memory(|memory| memory.focused()).unwrap())
+                .unwrap();
+            assert_ne!(response.id, view.focused.unwrap().1);
+            assert_ne!(response.id, notices.id);
+            assert!(
+                response.interact_rect.top() <= response.rect.top() + 1.0
+                    && response.interact_rect.bottom() >= response.rect.bottom() - 1.0,
+                "{size:?}, Clear selection: focused {:?}, visible {:?}",
+                response.rect,
+                response.interact_rect,
+            );
+
+            // Revealing a newly focused control must not continuously pull
+            // the page back when the user then chooses to scroll manually.
+            frame(
+                &mut view,
+                &snapshot,
+                vec![
+                    egui::Event::PointerMoved(response.interact_rect.center()),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, -100.0),
+                        phase: egui::TouchPhase::Move,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            for _ in 0..20 {
+                frame(&mut view, &snapshot, vec![]);
+            }
+            let manually_scrolled = ctx.read_response(response.id).unwrap();
+            assert!(manually_scrolled.has_focus());
+            assert!(manually_scrolled.rect.top() < response.rect.top() - 50.0);
         }
     }
 

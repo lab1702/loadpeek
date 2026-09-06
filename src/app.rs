@@ -378,11 +378,11 @@ impl Loadpeek {
                 );
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui
+                let pause_response = ui
                     .button(if self.paused { "Resume" } else { "Pause" })
-                    .on_hover_text("Alt+P · Resume starts a fresh history")
-                    .clicked()
-                {
+                    .on_hover_text("Alt+P · Resume starts a fresh history");
+                scroll_on_focus(&pause_response);
+                if pause_response.clicked() {
                     self.toggle_pause();
                 }
                 let before = self.settings.refresh_secs;
@@ -400,7 +400,7 @@ impl Loadpeek {
                         }
                     });
                 let label = ui.label(RichText::new("Refresh").color(SUBTEXT));
-                refresh_response.response.labelled_by(label.id);
+                scroll_on_focus(&refresh_response.response.labelled_by(label.id));
                 if before != self.settings.refresh_secs {
                     let _ = self
                         .commands
@@ -652,7 +652,7 @@ impl Loadpeek {
         ui.horizontal(|ui| {
             ui.label(RichText::new(title).strong().color(color).size(15.0));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui
+                let response = ui
                     .add(
                         egui::Button::new(
                             RichText::new(format!("View {}", page.name()))
@@ -661,9 +661,9 @@ impl Loadpeek {
                         )
                         .frame(false),
                     )
-                    .on_hover_text(format!("Open {} page", page.name()))
-                    .clicked()
-                {
+                    .on_hover_text(format!("Open {} page", page.name()));
+                scroll_on_focus(&response);
+                if response.clicked() {
                     self.page = page;
                 }
             });
@@ -748,12 +748,14 @@ impl Loadpeek {
             ui.label(RichText::new(format!("{} online", s.cores.len())).color(SUBTEXT));
             ui.add_space(18.0);
             let label = ui.label("Filter core:");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.core_filter)
-                    .hint_text("e.g. 12")
-                    .desired_width(120.0),
-            )
-            .labelled_by(label.id);
+            let response = ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.core_filter)
+                        .hint_text("e.g. 12")
+                        .desired_width(120.0),
+                )
+                .labelled_by(label.id);
+            scroll_on_focus(&response);
         });
         ui.add_space(12.0);
         let cores: Vec<_> = s
@@ -890,7 +892,7 @@ impl Loadpeek {
         let unavailable = !self.disk.is_empty() && !s.disks.iter().any(|d| d.name == self.disk);
         ui.horizontal_wrapped(|ui| {
             let label = ui.label("Device");
-            egui::ComboBox::from_id_salt("disk_selector")
+            let response = egui::ComboBox::from_id_salt("disk_selector")
                 .selected_text(if self.disk.is_empty() {
                     "All devices".to_owned()
                 } else if unavailable {
@@ -914,6 +916,7 @@ impl Loadpeek {
                 })
                 .response
                 .labelled_by(label.id);
+            scroll_on_focus(&response);
             small(ui, "Whole block devices · duplicate layers excluded");
         });
         ui.add_space(16.0);
@@ -972,7 +975,7 @@ impl Loadpeek {
             !self.network.is_empty() && !s.networks.iter().any(|d| d.name == self.network);
         ui.horizontal_wrapped(|ui| {
             let label = ui.label("Interface");
-            egui::ComboBox::from_id_salt("network_selector")
+            let response = egui::ComboBox::from_id_salt("network_selector")
                 .selected_text(if self.network.is_empty() {
                     "All interfaces".to_owned()
                 } else if unavailable {
@@ -996,6 +999,7 @@ impl Loadpeek {
                 })
                 .response
                 .labelled_by(label.id);
+            scroll_on_focus(&response);
             small(ui, "Loopback excluded · rates in bytes per second");
         });
         ui.add_space(16.0);
@@ -1146,9 +1150,10 @@ impl Loadpeek {
             heading(ui, "Display", MAUVE);
             let label = ui.label("Text and interface size");
             let before = self.settings.scale;
-            egui::ComboBox::from_id_salt("interface_scale").selected_text(format!("{:.0}%", self.settings.scale * 100.0)).show_ui(ui, |ui| {
+            let response = egui::ComboBox::from_id_salt("interface_scale").selected_text(format!("{:.0}%", self.settings.scale * 100.0)).show_ui(ui, |ui| {
                 for scale in [1.0, 1.25, 1.5, 1.75, 2.0] { ui.selectable_value(&mut self.settings.scale, scale, format!("{:.0}%", scale * 100.0)); }
             }).response.labelled_by(label.id);
+            scroll_on_focus(&response);
             if self.settings.scale != before { ctx.set_zoom_factor(self.settings.scale); self.persist(); }
             ui.add_space(16.0);
             heading(ui, "Keyboard", LAVENDER);
@@ -1277,18 +1282,16 @@ impl eframe::App for Loadpeek {
                                     )
                                 },
                             );
-                            if notice_count > 0
-                                && ui
-                                    .button(
-                                        RichText::new(format!(
-                                            "{notice_count} availability notices"
-                                        ))
+                            if notice_count > 0 {
+                                let response = ui.button(
+                                    RichText::new(format!("{notice_count} availability notices"))
                                         .size(12.0)
                                         .color(YELLOW),
-                                    )
-                                    .clicked()
-                            {
-                                self.notices_open = true;
+                                );
+                                scroll_on_focus(&response);
+                                if response.clicked() {
+                                    self.notices_open = true;
+                                }
                             }
                         });
                         ui.add_space(14.0);
@@ -1325,6 +1328,13 @@ impl eframe::App for Loadpeek {
                     ui.label(warning);
                 }
             });
+    }
+}
+
+fn scroll_on_focus(response: &egui::Response) {
+    // Reveal keyboard/assistive-technology focus without undoing later manual scrolling.
+    if response.gained_focus() {
+        response.scroll_to_me(None);
     }
 }
 
@@ -1604,6 +1614,139 @@ mod tests {
         let _ = ctx.run_logic(&egui::RawInput::default(), |ctx| {
             app.logic(ctx, &mut eframe::Frame::_new_kittest());
         });
+    }
+
+    #[test]
+    fn keyboard_focus_reveals_page_controls_after_scrolling() {
+        use egui::accesskit::Role;
+        use std::collections::HashSet;
+
+        for size in [egui::vec2(320.0, 240.0), egui::vec2(640.0, 480.0)] {
+            for page in Page::ALL
+                .into_iter()
+                .filter(|page| *page != Page::Processes)
+            {
+                let (mut app, _samples, _commands) = test_app();
+                app.page = page;
+                app.history.push(
+                    0.0,
+                    Snapshot {
+                        memory: crate::metrics::Memory {
+                            total_bytes: 8 * 1024 * 1024 * 1024,
+                            ..Default::default()
+                        },
+                        warnings: vec!["Test availability notice".into()],
+                        ..Snapshot::default()
+                    },
+                );
+                let ctx = egui::Context::default();
+                ctx.enable_accesskit();
+                crate::theme::apply(&ctx);
+                ctx.all_styles_mut(|style| {
+                    style.scroll_animation = egui::style::ScrollAnimation::none();
+                });
+                let mut frame = |events| {
+                    let output = ctx.run_ui(
+                        egui::RawInput {
+                            events,
+                            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                            ..Default::default()
+                        },
+                        |ui| app.ui(ui, &mut eframe::Frame::_new_kittest()),
+                    );
+                    let focused = ctx.memory(|memory| memory.focused()).and_then(|id| {
+                        let response = ctx.read_response(id)?;
+                        let (_, node) = output
+                            .platform_output
+                            .accesskit_update
+                            .as_ref()?
+                            .nodes
+                            .iter()
+                            .find(|(node_id, _)| *node_id == id.accesskit_id())?;
+                        Some((
+                            response,
+                            node.role(),
+                            node.label().unwrap_or_default().to_owned(),
+                            node.value().unwrap_or_default().to_owned(),
+                        ))
+                    });
+                    output.drop_without_applying_deltas();
+                    focused
+                };
+                let scroll_down = || {
+                    vec![
+                        egui::Event::PointerMoved(egui::pos2(size.x / 2.0, size.y - 40.0)),
+                        egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta: egui::vec2(0.0, -1000.0),
+                            phase: egui::TouchPhase::Move,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ]
+                };
+                for _ in 0..4 {
+                    frame(vec![]);
+                }
+                for _ in 0..30 {
+                    frame(scroll_down());
+                }
+                for _ in 0..20 {
+                    frame(vec![]);
+                }
+                let mut seen = HashSet::new();
+                let mut saw_pause = false;
+                let mut saw_refresh = false;
+                let mut saw_notices = false;
+                for _ in 0..40 {
+                    frame(vec![egui::Event::Key {
+                        key: egui::Key::Tab,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }]);
+                    for _ in 0..4 {
+                        frame(vec![]);
+                    }
+                    let Some((response, role, label, value)) = frame(vec![]) else {
+                        continue;
+                    };
+                    if !seen.insert(response.id) {
+                        break;
+                    }
+                    if matches!(role, Role::Button | Role::ComboBox | Role::TextInput) {
+                        assert!(
+                            response.interact_rect.contains_rect(response.rect),
+                            "{size:?}, {page:?}, {label} {value}: focused {:?}, visible {:?}",
+                            response.rect,
+                            response.interact_rect
+                        );
+                    }
+                    saw_pause |= label == "Pause";
+                    saw_refresh |= role == Role::ComboBox && value == "1.0 s";
+                    saw_notices |= label == "1 availability notices";
+                    if label == "Pause" {
+                        // Revealing newly focused controls must still allow a later wheel scroll.
+                        for _ in 0..10 {
+                            frame(scroll_down());
+                        }
+                        for _ in 0..20 {
+                            frame(vec![]);
+                        }
+                        let (scrolled, _, _, _) = frame(vec![]).unwrap();
+                        assert_eq!(scrolled.id, response.id);
+                        assert!(
+                            scrolled.rect.top() < response.rect.top() - 10.0,
+                            "{size:?}, {page:?}: manual scrolling did not move the focused control"
+                        );
+                    }
+                }
+                assert!(
+                    saw_pause && saw_refresh && saw_notices,
+                    "{size:?}, {page:?}: toolbar controls were skipped"
+                );
+            }
+        }
     }
 
     #[test]
