@@ -781,6 +781,11 @@ fn cpu_sensor_name(source: &str, label: &str) -> bool {
     if source.contains("vrm") || label.contains("vrm") {
         return false;
     }
+    // Nuvoton's combined channel is max(CPU, MCH), so chipset heat can
+    // dominate it. Keep the reading in hardware details, outside the CPU headline.
+    if source == "pch_chip_cpu_max_temp" || label == "pch_chip_cpu_max_temp" {
+        return false;
+    }
     [
         "coretemp",
         "k10temp",
@@ -2197,6 +2202,84 @@ mod tests {
     }
 
     #[test]
+    fn combined_pch_temperatures_remain_visible_without_supplying_the_cpu_headline() {
+        for directory in ["class/hwmon/hwmon0", "class/hwmon/hwmon0/device"] {
+            for label in ["PCH_CHIP_CPU_MAX_TEMP", "pch_chip_cpu_max_temp"] {
+                let fixture = Fixture::new();
+                fixture.write(&format!("{directory}/name"), "nct6796");
+                fixture.write(&format!("{directory}/temp1_label"), label);
+                fixture.write(&format!("{directory}/temp1_input"), "80000");
+                fixture.write(&format!("{directory}/temp1_crit"), "95000");
+                let sample = || {
+                    let mut warnings = Vec::new();
+                    let snapshot = Snapshot {
+                        sensors: discover_sensors(&fixture.0, &mut warnings),
+                        ..Snapshot::default()
+                    };
+                    assert!(warnings.is_empty(), "{warnings:?}");
+                    snapshot
+                };
+
+                let composite_only = sample();
+                assert_eq!(composite_only.sensors.len(), 1);
+                let composite = &composite_only.sensors[0];
+                assert_eq!(composite.label, format!("nct6796 · {label}"));
+                assert_eq!(composite.celsius, 80.0);
+                assert_eq!(composite.critical_celsius, Some(95.0));
+                assert_eq!(
+                    composite_only.cpu_temperature(),
+                    None,
+                    "{directory}: {label}"
+                );
+                assert!(!composite.is_cpu);
+
+                fixture.write(&format!("{directory}/temp2_label"), "PCH_CPU_TEMP");
+                fixture.write(&format!("{directory}/temp2_input"), "45000");
+                fixture.write(&format!("{directory}/temp3_label"), "PCH_MCH_TEMP");
+                fixture.write(&format!("{directory}/temp3_input"), "80000");
+                fixture.write("class/hwmon/hwmon1/name", "coretemp");
+                fixture.write("class/hwmon/hwmon1/temp1_label", "Package id 0");
+                fixture.write("class/hwmon/hwmon1/temp1_input", "40000");
+                let mixed = sample();
+                assert_eq!(mixed.sensors.len(), 4);
+                assert_eq!(mixed.cpu_temperature(), Some(45.0), "{directory}: {label}");
+                assert_eq!(
+                    mixed.sensors.iter().filter(|sensor| sensor.is_cpu).count(),
+                    2
+                );
+
+                // Losing the PCH CPU reading must leave the package reading
+                // authoritative even while the hotter composite remains.
+                fs::remove_file(fixture.0.join(format!("{directory}/temp2_input"))).unwrap();
+                assert_eq!(sample().cpu_temperature(), Some(40.0));
+            }
+        }
+    }
+
+    #[test]
+    fn combined_pch_thermal_zones_do_not_supply_the_cpu_headline() {
+        for source in ["PCH_CHIP_CPU_MAX_TEMP", "pch_chip_cpu_max_temp"] {
+            let fixture = Fixture::new();
+            fixture.write("class/thermal/thermal_zone0/type", source);
+            fixture.write("class/thermal/thermal_zone0/temp", "80000");
+            fixture.write("class/thermal/thermal_zone0/trip_point_0_type", "critical");
+            fixture.write("class/thermal/thermal_zone0/trip_point_0_temp", "95000");
+            let mut warnings = Vec::new();
+            let snapshot = Snapshot {
+                sensors: discover_sensors(&fixture.0, &mut warnings),
+                ..Snapshot::default()
+            };
+            assert!(warnings.is_empty(), "{warnings:?}");
+            assert_eq!(snapshot.sensors.len(), 1);
+            assert_eq!(snapshot.sensors[0].label, source);
+            assert_eq!(snapshot.sensors[0].celsius, 80.0);
+            assert_eq!(snapshot.sensors[0].critical_celsius, Some(95.0));
+            assert!(!snapshot.sensors[0].is_cpu, "{source}");
+            assert_eq!(snapshot.cpu_temperature(), None, "{source}");
+        }
+    }
+
+    #[test]
     fn cpu_sensor_driver_and_channel_recognition_is_retained() {
         for (driver, label) in [
             ("coretemp", "Package id 0"),
@@ -2206,6 +2289,7 @@ mod tests {
             ("peci_cputemp", "Die"),
             ("peci_cputemp.cpu12", "Die"),
             ("board_sensor", "CPU"),
+            ("board_sensor", "CPU_MAX_TEMP"),
         ] {
             let fixture = Fixture::new();
             fixture.write("class/hwmon/hwmon0/name", driver);
