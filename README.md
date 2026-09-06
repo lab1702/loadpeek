@@ -45,6 +45,7 @@ For runtime troubleshooting, Debian provides [libgl1](https://packages.debian.or
 | **Disk** | Combined or selected-device read/write history, current rates, and lifetime counters for each detected whole leaf block device. |
 | **Network** | Combined or selected-interface incoming/outgoing history, current rates, interface state, and lifetime byte counters. |
 | **Thermals** | The hottest recognized CPU sensor and individual hardware temperature histories, with critical thresholds when the driver reports them. |
+| **Processes** | A sortable, filterable process table with PID, user, priority, nice value, virtual/resident/shared memory, state, CPU%, memory%, CPU time, and command. Select a row for full process details. |
 
 Layouts reduce their column count as space narrows. Detail pages scroll when their content exceeds the window. Paired throughput charts use named solid and dashed lines as well as different colors.
 
@@ -74,6 +75,7 @@ If `XDG_CONFIG_HOME` is unset, empty, or relative, the location is `$HOME/.confi
 | `Alt+4` | Disk |
 | `Alt+5` | Network |
 | `Alt+6` | Thermals |
+| `Alt+7` | Processes |
 | `Alt+P` | Pause or resume |
 | `Alt+S` | Toggle settings |
 | `Tab` / `Shift+Tab` | Move between controls |
@@ -82,6 +84,9 @@ If `XDG_CONFIG_HOME` is unset, empty, or relative, the location is `$HOME/.confi
 | Left / Right on a focused chart | Inspect the previous / next historical sample |
 | Home / End on a focused chart | Jump to the oldest / newest sample |
 | Escape on a focused chart | Leave chart inspection |
+| Up / Down on a focused process row | Select the previous / next process |
+| Page Up / Page Down on a focused process row | Move through the process list one page at a time |
+| Home / End on a focused process row | Select the first / last matching process |
 
 Your desktop or window manager may reserve an Alt shortcut before it reaches the application. The corresponding on-screen controls remain available.
 
@@ -113,6 +118,18 @@ Temperatures come from `/sys/class/hwmon`, with thermal-zone readings used to fi
 
 Some VMs, containers, and hardware drivers do not expose clocks, disks, network interfaces, or temperatures. Loadpeek shows unavailable values and collection notices while continuing to display other measurements. Container views can also mix host-wide and namespace-specific counters; Loadpeek does not reinterpret those values as container resource quotas.
 
+### Processes
+
+The process table samples numeric PID directories in `/proc` on the same background collector and refresh schedule as other metrics. It retains only the current snapshot. Pause freezes the list; resuming primes fresh CPU counters. Rows represent processes (thread groups), with each process's thread count available in its details.
+
+Process CPU usage follows top's usual convention: **100% is one logical core**, and a multithreaded process may exceed 100%. This differs from the Summary page, whose overall CPU percentage is normalized across all logical cores. The rate is the change in user plus system CPU ticks over actual elapsed time, converted using the kernel's clock-tick frequency. TIME+ is cumulative CPU time, not elapsed wall time. A new process, reused PID, or reset counter needs a second valid reading before it has a CPU rate.
+
+RES is resident memory; VIRT is virtual address space; SHR is shared resident memory reported by `statm`. Memory percentage is RES divided by system physical RAM. These kernel accounting values are approximate; summing RES across processes can double-count shared pages. Units use binary multiples. User names resolve from local account records, with a numeric effective UID fallback.
+
+Processes that exit while being sampled are omitted. Linux permissions, `hidepid`, containers, or namespaces may limit the visible list or particular fields; unavailable values are marked instead of fabricated. Selecting a process retains its PID and start-time identity so a reused PID cannot silently replace it in the details view. Command lines come from `cmdline` and are capped at 64 KiB with an ellipsis; kernel threads fall back to their bracketed names. The monitor reads no process environment variables and does not send signals or change process priority.
+
+See the Linux kernel's [process information documentation](https://docs.kernel.org/filesystems/proc.html#process-specific-subdirectories).
+
 ## Accessibility
 
 The Mocha palette is used with restricted foreground/background pairings. Unit tests check the chosen text colors against **4.5:1** minimum contrast and chart strokes, focus indicators, and control boundaries against **3:1**, following the relevant [WCAG text contrast](https://www.w3.org/WAI/WCAG22/Understanding/contrast-minimum.html) and [non-text contrast](https://www.w3.org/WAI/WCAG22/Understanding/non-text-contrast.html) criteria. Decorative chart grid lines are not used to convey a value by themselves.
@@ -129,7 +146,7 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
-Tests cover counter parsing, CPU guest accounting, counter resets, variable elapsed intervals, memory calculations, disk topology, missing sources, temperature discovery, real-time history retention, chart gaps/scales, settings persistence, and contrast pairings. Desktop rendering and assistive technology still require GUI checks on a running Linux session.
+Tests cover counter parsing, CPU guest accounting, counter resets, variable elapsed intervals, memory calculations, disk topology, missing sources, temperature discovery, real-time history retention, chart gaps/scales, process identity and exit races, process sorting and filtering, settings persistence, and contrast pairings. Desktop rendering and assistive technology still require GUI checks on a running Linux session.
 
 See [the validation record](docs/VALIDATION.md) for the tested environment, native GUI checks, and remaining manual checks.
 

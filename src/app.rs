@@ -12,6 +12,8 @@ use crate::{
     chart::{self, Series},
     history::History,
     metrics::{Collector, Snapshot},
+    process_view::ProcessView,
+    processes::{ProcessCollector, ProcessSnapshot},
     settings::Settings,
     theme::*,
 };
@@ -25,15 +27,17 @@ enum Page {
     Disk,
     Network,
     Thermals,
+    Processes,
 }
 impl Page {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::Summary,
         Self::Cpu,
         Self::Memory,
         Self::Disk,
         Self::Network,
         Self::Thermals,
+        Self::Processes,
     ];
     fn name(self) -> &'static str {
         match self {
@@ -43,6 +47,7 @@ impl Page {
             Self::Disk => "Disk",
             Self::Network => "Network",
             Self::Thermals => "Thermals",
+            Self::Processes => "Processes",
         }
     }
     fn subtitle(self) -> &'static str {
@@ -53,6 +58,7 @@ impl Page {
             Self::Disk => "Read and write activity across your block devices.",
             Self::Network => "Incoming and outgoing traffic by interface.",
             Self::Thermals => "Temperature readings reported by your hardware.",
+            Self::Processes => "A closer look at what is running on your system.",
         }
     }
     fn color(self) -> Color32 {
@@ -63,6 +69,7 @@ impl Page {
             Self::Disk => GREEN,
             Self::Network => TEAL,
             Self::Thermals => PEACH,
+            Self::Processes => LAVENDER,
         }
     }
 }
@@ -74,6 +81,7 @@ enum Command {
 struct Sample {
     at: f64,
     snapshot: Snapshot,
+    processes: ProcessSnapshot,
 }
 
 pub struct Loadpeek {
@@ -89,6 +97,8 @@ pub struct Loadpeek {
     disk: String,
     network: String,
     core_filter: String,
+    processes: ProcessSnapshot,
+    process_view: ProcessView,
 }
 
 impl Loadpeek {
@@ -105,15 +115,19 @@ impl Loadpeek {
             .spawn(move || {
                 let start = Instant::now();
                 let mut collector = Collector::new();
+                let mut process_collector = ProcessCollector::new();
                 let mut paused = false;
                 let mut next = Instant::now();
                 loop {
                     if !paused && Instant::now() >= next {
                         let sample_start = Instant::now();
-                        let snapshot = collector.sample();
+                        let mut snapshot = collector.sample();
+                        let processes = process_collector.sample(snapshot.memory.total_bytes);
+                        snapshot.warnings.extend(processes.warnings.iter().cloned());
                         let sample = Sample {
                             at: start.elapsed().as_secs_f64(),
                             snapshot,
+                            processes,
                         };
                         match sample_tx.try_send(sample) {
                             Ok(()) => ctx.request_repaint(),
@@ -136,6 +150,7 @@ impl Loadpeek {
                             paused = value;
                             if !paused {
                                 collector = Collector::new();
+                                process_collector = ProcessCollector::new();
                                 next = Instant::now();
                             }
                         }
@@ -158,6 +173,8 @@ impl Loadpeek {
             disk: String::new(),
             network: String::new(),
             core_filter: String::new(),
+            processes: ProcessSnapshot::default(),
+            process_view: ProcessView::default(),
         }
     }
 
@@ -166,6 +183,7 @@ impl Loadpeek {
         if !self.paused {
             while self.samples.try_recv().is_ok() {}
             self.history = History::default();
+            self.processes = ProcessSnapshot::default();
         }
         let _ = self.commands.send(Command::Pause(self.paused));
     }
@@ -1051,7 +1069,7 @@ impl Loadpeek {
             if self.settings.scale != before { ctx.set_zoom_factor(self.settings.scale); self.persist(); }
             ui.add_space(16.0);
             heading(ui, "Keyboard", LAVENDER);
-            for (key, action) in [("Tab / Shift+Tab", "Move between controls"), ("Enter / Space", "Activate the focused control"), ("Alt+1 … Alt+6", "Switch pages"), ("Alt+P", "Pause or resume samples"), ("Alt+S", "Open settings"), ("Arrow keys", "Navigate open menus")] { metric_row(ui, key, action.into()); }
+            for (key, action) in [("Tab / Shift+Tab", "Move between controls"), ("Enter / Space", "Activate the focused control"), ("Alt+1 … Alt+7", "Switch pages"), ("Alt+P", "Pause or resume samples"), ("Alt+S", "Open settings"), ("Arrow keys", "Navigate open menus"), ("Up / Down on a process row", "Select previous / next process"), ("Page Up / Down on a process row", "Move one page through processes"), ("Home / End on a process row", "Select first / last process")] { metric_row(ui, key, action.into()); }
             ui.add_space(16.0);
             ui.label("Charts use labels and line patterns as well as color. Current values and history statistics are also available as text. Screen reader support uses AccessKit.");
             ui.add_space(10.0);
@@ -1067,6 +1085,9 @@ impl eframe::App for Loadpeek {
         while let Ok(sample) = self.samples.try_recv() {
             if !self.paused {
                 self.history.push(sample.at, sample.snapshot);
+                // The process list is a current view, not a 60-second archive
+                // of thousands of command lines.
+                self.processes = sample.processes;
             }
         }
         ctx.input_mut(|input| {
@@ -1077,6 +1098,7 @@ impl eframe::App for Loadpeek {
                 egui::Key::Num4,
                 egui::Key::Num5,
                 egui::Key::Num6,
+                egui::Key::Num7,
             ]
             .into_iter()
             .zip(Page::ALL)
@@ -1097,7 +1119,8 @@ impl eframe::App for Loadpeek {
             load: [f64::NAN; 3],
             ..Snapshot::default()
         });
-        let wide = ui.available_width() >= 900.0 && ui.available_height() >= 700.0;
+        // Keep the seven navigation rows clear of the sidebar footer.
+        let wide = ui.available_width() >= 900.0 && ui.available_height() >= 840.0;
         if wide {
             self.navigation(ui, &s);
         }
@@ -1149,11 +1172,22 @@ impl eframe::App for Loadpeek {
                         ui.horizontal_wrapped(|ui| {
                             small(
                                 ui,
-                                &format!(
-                                    "LAST 60 SECONDS  ·  {:.0}s collected  ·  {} samples",
-                                    self.history.span_seconds().min(60.0),
-                                    self.history.len()
-                                ),
+                                &if self.page == Page::Processes {
+                                    if self.paused {
+                                        "PAUSED PROCESS SNAPSHOT".into()
+                                    } else {
+                                        format!(
+                                            "CURRENT PROCESSES  ·  refresh every {:.1}s",
+                                            self.settings.refresh_secs
+                                        )
+                                    }
+                                } else {
+                                    format!(
+                                        "LAST 60 SECONDS  ·  {:.0}s collected  ·  {} samples",
+                                        self.history.span_seconds().min(60.0),
+                                        self.history.len()
+                                    )
+                                },
                             );
                             if notice_count > 0
                                 && ui
@@ -1181,6 +1215,7 @@ impl eframe::App for Loadpeek {
                             Page::Disk => self.disk(ui, &s),
                             Page::Network => self.network(ui, &s),
                             Page::Thermals => self.thermals(ui, &s),
+                            Page::Processes => self.process_view.show(ui, &self.processes),
                         }
                         ui.add_space(12.0);
                         small(ui, "LOCAL METRICS  /  No account. No telemetry.");

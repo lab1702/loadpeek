@@ -2,6 +2,8 @@ mod app;
 mod chart;
 mod history;
 mod metrics;
+mod process_view;
+mod processes;
 mod settings;
 mod theme;
 
