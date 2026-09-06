@@ -782,7 +782,7 @@ fn discover_sensors(sys_root: &Path, warnings: &mut Vec<String>) -> Vec<Sensor> 
     let mut available_sources = BTreeSet::new();
     let mut rejected_sources = BTreeSet::new();
     let mut inaccessible = 0;
-    let mut unconverted_vt1211 = 0;
+    let mut unconverted_channels = BTreeMap::<&str, usize>::new();
     if let Ok(entries) = fs::read_dir(sys_root.join("class/hwmon")) {
         for entry in entries.flatten() {
             let root = entry.path();
@@ -825,11 +825,24 @@ fn discover_sensors(sys_root: &Path, warnings: &mut Vec<String>) -> Vec<Sensor> 
                         rejected_sources.insert(canonical);
                         continue;
                     }
-                    // Only the internal diode (temp2) is calibrated by vt1211.
-                    // Its other channels require board-specific conversion;
-                    // temp3-temp7 even expose millivolts rather than millidegrees.
-                    if driver == "vt1211" && channel != "temp2" {
-                        unconverted_vt1211 += 1;
+                    // These external channels require board-specific conversion,
+                    // and some expose millivolts rather than millidegrees. Keep
+                    // the calibrated internal diode or PMIC channels.
+                    let conversion_driver = match driver.as_str() {
+                        "vt1211" if channel != "temp2" => Some("VT1211"),
+                        "wm831x" if channel == "temp2" => Some("WM831x"),
+                        "vt8231"
+                            if matches!(
+                                channel,
+                                "temp2" | "temp3" | "temp4" | "temp5" | "temp6"
+                            ) =>
+                        {
+                            Some("VT8231")
+                        }
+                        _ => None,
+                    };
+                    if let Some(driver) = conversion_driver {
+                        *unconverted_channels.entry(driver).or_default() += 1;
                         rejected_sources.insert(canonical);
                         continue;
                     }
@@ -945,9 +958,9 @@ fn discover_sensors(sys_root: &Path, warnings: &mut Vec<String>) -> Vec<Sensor> 
             "{inaccessible} temperature reading(s) were unavailable or invalid."
         ));
     }
-    if unconverted_vt1211 > 0 {
+    for (driver, count) in unconverted_channels {
         warnings.push(format!(
-            "{unconverted_vt1211} VT1211 external sensor channel(s) require board-specific conversion and are omitted."
+            "{count} {driver} external sensor channel(s) require board-specific conversion and are omitted."
         ));
     }
     sensors
@@ -1782,6 +1795,79 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("require board-specific conversion"))
         );
+    }
+
+    #[test]
+    fn temperature_unconverted_wm831x_and_vt8231_channels_preserve_calibrated_inputs() {
+        for (driver, notice_name, channels) in
+            [("wm831x", "WM831x", 2..=2), ("vt8231", "VT8231", 2..=6)]
+        {
+            for directory in ["class/hwmon/hwmon0", "class/hwmon/hwmon0/device"] {
+                let fixture = Fixture::new();
+                fixture.write(&format!("{directory}/name"), driver);
+                fixture.write(&format!("{directory}/temp1_input"), "42000");
+                fixture.write(&format!("{directory}/temp1_crit"), "100000");
+                for channel in channels.clone() {
+                    // WM831x reports battery thermistor millivolts; VT8231's
+                    // external thermistors also require board-specific conversion.
+                    fixture.write(&format!("{directory}/temp{channel}_input"), "1100");
+                }
+                let mut warnings = Vec::new();
+                let sensors = discover_sensors(&fixture.0, &mut warnings);
+                assert_eq!(sensors.len(), 1, "{driver} at {directory}");
+                assert_eq!(sensors[0].label, format!("{driver} · temp1"));
+                assert_eq!(sensors[0].celsius, 42.0);
+                assert_eq!(sensors[0].critical_celsius, Some(100.0));
+                assert_eq!(
+                    warnings,
+                    [format!(
+                        "{} {notice_name} external sensor channel(s) require board-specific conversion and are omitted.",
+                        channels.clone().count()
+                    )]
+                );
+
+                // Identical channel numbers on ordinary drivers remain readings.
+                fixture.write(&format!("{directory}/name"), "other");
+                warnings.clear();
+                assert_eq!(
+                    discover_sensors(&fixture.0, &mut warnings).len(),
+                    channels.clone().count() + 1
+                );
+                assert!(warnings.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn temperature_unconverted_channels_reject_aliases_and_keep_availability_notices() {
+        use std::os::unix::fs::symlink;
+
+        for (driver, notice_name) in [("wm831x", "WM831x"), ("vt8231", "VT8231")] {
+            for (directory, alias) in [
+                ("class/hwmon/hwmon0", "class/hwmon/hwmon0/device"),
+                ("class/hwmon/hwmon0/device", "class/hwmon/hwmon0"),
+            ] {
+                let fixture = Fixture::new();
+                fixture.write(&format!("{directory}/name"), driver);
+                fixture.write(&format!("{directory}/temp2_input"), "1100");
+                let input = fixture.0.join(format!("{directory}/temp2_input"));
+                fs::create_dir_all(fixture.0.join(alias)).unwrap();
+                symlink(&input, fixture.0.join(format!("{alias}/temp2_input"))).unwrap();
+                fixture.write("class/thermal/thermal_zone0/type", driver);
+                symlink(&input, fixture.0.join("class/thermal/thermal_zone0/temp")).unwrap();
+
+                let mut warnings = Vec::new();
+                assert!(discover_sensors(&fixture.0, &mut warnings).is_empty());
+                assert_eq!(warnings.len(), 2);
+                assert!(warnings[0].contains("Temperature sensors are unavailable"));
+                assert_eq!(
+                    warnings[1],
+                    format!(
+                        "1 {notice_name} external sensor channel(s) require board-specific conversion and are omitted."
+                    )
+                );
+            }
+        }
     }
 
     #[test]

@@ -171,11 +171,18 @@ pub struct Loadpeek {
     process_view: ProcessView,
 }
 
+fn configure_context(ctx: &egui::Context, settings: &Settings) {
+    crate::theme::apply(ctx);
+    // Interface size is controlled by the saved Settings preference. egui's
+    // independent keyboard zoom would leave that preference and selector stale.
+    ctx.options_mut(|options| options.zoom_with_keyboard = false);
+    ctx.set_zoom_factor(settings.scale);
+}
+
 impl Loadpeek {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        crate::theme::apply(&cc.egui_ctx);
         let (settings, config_notice) = crate::settings::load();
-        cc.egui_ctx.set_zoom_factor(settings.scale);
+        configure_context(&cc.egui_ctx, &settings);
         let (sample_tx, samples) = mpsc::sync_channel(2);
         let (commands, command_rx) = mpsc::channel();
         let ctx = cc.egui_ctx.clone();
@@ -1597,6 +1604,68 @@ mod tests {
         let _ = ctx.run_logic(&egui::RawInput::default(), |ctx| {
             app.logic(ctx, &mut eframe::Frame::_new_kittest());
         });
+    }
+
+    #[test]
+    fn keyboard_zoom_keeps_configured_scale_and_settings_selector_in_sync() {
+        for key in [
+            egui::Key::Equals,
+            egui::Key::Plus,
+            egui::Key::Minus,
+            egui::Key::Num0,
+        ] {
+            let (mut app, _samples, _commands) = test_app();
+            app.settings.scale = 1.25;
+            app.settings_open = true;
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            configure_context(&ctx, &app.settings);
+            for frame in 0..5 {
+                let events = if frame == 2 {
+                    vec![egui::Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers {
+                            ctrl: true,
+                            command: true,
+                            shift: key == egui::Key::Plus,
+                            ..Default::default()
+                        },
+                    }]
+                } else {
+                    Vec::new()
+                };
+                let output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1440.0, 1000.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| app.ui(ui, &mut eframe::Frame::_new_kittest()),
+                );
+                if frame == 4 {
+                    assert_eq!(ctx.zoom_factor(), 1.25, "Ctrl+{key:?}");
+                    assert_eq!(app.settings.scale, 1.25);
+                    assert!(
+                        output
+                            .platform_output
+                            .accesskit_update
+                            .as_ref()
+                            .unwrap()
+                            .nodes
+                            .iter()
+                            .any(|(_, node)| node.role() == egui::accesskit::Role::ComboBox
+                                && node.value() == Some("125%"))
+                    );
+                }
+                output.drop_without_applying_deltas();
+            }
+        }
     }
 
     #[test]

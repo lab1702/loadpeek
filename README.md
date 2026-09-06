@@ -71,7 +71,7 @@ Chart inspection keeps the selected observation as new samples arrive and preser
 
 **Pause** freezes collection and the displayed history. **Resume** starts a fresh history and primes rate counters again. Closing the application discards history.
 
-Open **Settings & accessibility** to change interface size from **100% to 200%**, in 25% steps. Refresh interval and interface scale are saved automatically to:
+Open **Settings & accessibility** to change interface size from **100% to 200%**, in 25% steps. The size control is keyboard-accessible through **Alt+S**; browser-style Ctrl+plus/minus/0 zoom shortcuts are disabled. Refresh interval and interface scale are saved automatically to:
 
 ```text
 $XDG_CONFIG_HOME/loadpeek/settings.json
@@ -134,7 +134,7 @@ A selected disk or network interface stays selected across pause/resume and miss
 
 Temperatures come from `/sys/class/hwmon`, with thermal-zone readings used to fill gaps. Driver labels identify channels, and critical limits appear only when reported. Faulted sensor readings are omitted with an availability notice. PECI control targets (Tcontrol, Tthrottle, and Tjmax) are excluded from measured temperatures. The CPU headline is the hottest sensor recognized as belonging to the CPU; recognition depends on driver and channel names. Readable inputs resolving to the same sysfs file are deduplicated. Other readings are retained when their shared identity cannot be proved, so similar driver names or equal temperatures cannot hide an available package sensor. See the [hwmon interface](https://docs.kernel.org/hwmon/sysfs-interface.html) and [PECI channel definitions](https://docs.kernel.org/hwmon/peci-cputemp.html#sysfs-interface).
 
-VT1211 external channels require board-specific conversion and are omitted with a notice; its calibrated internal diode remains available. Loadpeek does not apply `sensors.conf` conversion formulas. See the [VT1211 temperature definitions](https://docs.kernel.org/hwmon/vt1211.html#temperature-monitoring).
+VT1211 external channels, WM831x battery thermistors (`temp2`), and VT8231 external thermistors (`temp2`–`temp6`) require board-specific conversion and are omitted with a notice. Their calibrated internal diode or PMIC channels remain available. Loadpeek does not apply `sensors.conf` conversion formulas. See the [VT1211 temperature definitions](https://docs.kernel.org/hwmon/vt1211.html#temperature-monitoring), [WM831x driver](https://github.com/torvalds/linux/blob/master/drivers/hwmon/wm831x-hwmon.c), and [VT8231 driver](https://github.com/torvalds/linux/blob/master/drivers/hwmon/vt8231.c).
 
 For AMD sensors exposing both Tdie and Tctl, the CPU headline prefers the physical Tdie reading over the same device's offset fan-control Tctl value. CCD and other CPU temperatures still contribute to the hottest reading. Tctl remains visible under its driver label and is used as a fallback when that device has no valid Tdie reading. See the [k10temp temperature definitions](https://docs.kernel.org/hwmon/k10temp.html). Legacy hwmon layouts also retain their driver names when attributes are exposed under `device/`.
 
