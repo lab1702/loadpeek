@@ -76,12 +76,81 @@ impl Page {
 
 enum Command {
     Interval(f64),
-    Pause(bool),
+    Pause { paused: bool, generation: u64 },
 }
+#[derive(Debug)]
 struct Sample {
+    generation: u64,
     at: f64,
     snapshot: Snapshot,
     processes: ProcessSnapshot,
+}
+
+fn new_sampler() -> impl FnMut() -> (Snapshot, ProcessSnapshot) {
+    let mut collector = Collector::new();
+    let mut process_collector = ProcessCollector::new();
+    move || {
+        let snapshot = collector.sample();
+        let processes = process_collector.sample(snapshot.memory.total_bytes);
+        (snapshot, processes)
+    }
+}
+
+fn collect_samples<S: FnMut() -> (Snapshot, ProcessSnapshot)>(
+    mut interval: f64,
+    sample_tx: mpsc::SyncSender<Sample>,
+    command_rx: mpsc::Receiver<Command>,
+    mut make_sampler: impl FnMut() -> S,
+    request_repaint: impl Fn(),
+) {
+    let start = Instant::now();
+    let mut sample_metrics = make_sampler();
+    let mut paused = false;
+    let mut generation = 0;
+    let mut next = Instant::now();
+    loop {
+        if !paused && Instant::now() >= next {
+            let sample_start = Instant::now();
+            let (mut snapshot, processes) = sample_metrics();
+            snapshot.warnings.extend(processes.warnings.iter().cloned());
+            let sample = Sample {
+                generation,
+                at: start.elapsed().as_secs_f64(),
+                snapshot,
+                processes,
+            };
+            match sample_tx.try_send(sample) {
+                Ok(()) => request_repaint(),
+                Err(mpsc::TrySendError::Disconnected(_)) => break,
+                Err(mpsc::TrySendError::Full(_)) => {}
+            }
+            next = sample_start + Duration::from_secs_f64(interval);
+        }
+        let timeout = if paused {
+            Duration::from_secs(60)
+        } else {
+            next.saturating_duration_since(Instant::now())
+        };
+        match command_rx.recv_timeout(timeout) {
+            Ok(Command::Interval(seconds)) => {
+                interval = seconds.clamp(0.5, 5.0);
+                next = Instant::now() + Duration::from_secs_f64(interval);
+            }
+            Ok(Command::Pause {
+                paused: value,
+                generation: next_generation,
+            }) => {
+                paused = value;
+                if !paused {
+                    sample_metrics = make_sampler();
+                    generation = next_generation;
+                    next = Instant::now();
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
 }
 
 pub struct Loadpeek {
@@ -91,6 +160,7 @@ pub struct Loadpeek {
     commands: mpsc::Sender<Command>,
     settings: Settings,
     paused: bool,
+    generation: u64,
     settings_open: bool,
     notices_open: bool,
     config_notice: Option<String>,
@@ -109,55 +179,13 @@ impl Loadpeek {
         let (sample_tx, samples) = mpsc::sync_channel(2);
         let (commands, command_rx) = mpsc::channel();
         let ctx = cc.egui_ctx.clone();
-        let mut interval = settings.refresh_secs;
+        let interval = settings.refresh_secs;
         thread::Builder::new()
             .name("loadpeek-collector".into())
             .spawn(move || {
-                let start = Instant::now();
-                let mut collector = Collector::new();
-                let mut process_collector = ProcessCollector::new();
-                let mut paused = false;
-                let mut next = Instant::now();
-                loop {
-                    if !paused && Instant::now() >= next {
-                        let sample_start = Instant::now();
-                        let mut snapshot = collector.sample();
-                        let processes = process_collector.sample(snapshot.memory.total_bytes);
-                        snapshot.warnings.extend(processes.warnings.iter().cloned());
-                        let sample = Sample {
-                            at: start.elapsed().as_secs_f64(),
-                            snapshot,
-                            processes,
-                        };
-                        match sample_tx.try_send(sample) {
-                            Ok(()) => ctx.request_repaint(),
-                            Err(mpsc::TrySendError::Disconnected(_)) => break,
-                            Err(mpsc::TrySendError::Full(_)) => {}
-                        }
-                        next = sample_start + Duration::from_secs_f64(interval);
-                    }
-                    let timeout = if paused {
-                        Duration::from_secs(60)
-                    } else {
-                        next.saturating_duration_since(Instant::now())
-                    };
-                    match command_rx.recv_timeout(timeout) {
-                        Ok(Command::Interval(seconds)) => {
-                            interval = seconds.clamp(0.5, 5.0);
-                            next = Instant::now() + Duration::from_secs_f64(interval);
-                        }
-                        Ok(Command::Pause(value)) => {
-                            paused = value;
-                            if !paused {
-                                collector = Collector::new();
-                                process_collector = ProcessCollector::new();
-                                next = Instant::now();
-                            }
-                        }
-                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                        Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    }
-                }
+                collect_samples(interval, sample_tx, command_rx, new_sampler, || {
+                    ctx.request_repaint();
+                });
             })
             .expect("could not start metric collector");
         Self {
@@ -167,6 +195,7 @@ impl Loadpeek {
             commands,
             settings,
             paused: false,
+            generation: 0,
             settings_open: false,
             notices_open: false,
             config_notice,
@@ -181,11 +210,17 @@ impl Loadpeek {
     fn toggle_pause(&mut self) {
         self.paused = !self.paused;
         if !self.paused {
+            // In-flight collections can publish after this drain. Only samples
+            // from the worker's new baseline may enter the resumed history.
+            self.generation = self.generation.wrapping_add(1);
             while self.samples.try_recv().is_ok() {}
             self.history = History::default();
             self.processes = ProcessSnapshot::default();
         }
-        let _ = self.commands.send(Command::Pause(self.paused));
+        let _ = self.commands.send(Command::Pause {
+            paused: self.paused,
+            generation: self.generation,
+        });
     }
     fn persist(&mut self) {
         self.config_notice = self.settings.save().err();
@@ -822,19 +857,27 @@ impl Loadpeek {
     }
 
     fn disk(&mut self, ui: &mut Ui, s: &Snapshot) {
-        if !self.disk.is_empty() && !s.disks.iter().any(|d| d.name == self.disk) {
-            self.disk.clear();
-        }
+        let unavailable = !self.disk.is_empty() && !s.disks.iter().any(|d| d.name == self.disk);
         ui.horizontal_wrapped(|ui| {
             let label = ui.label("Device");
             egui::ComboBox::from_id_salt("disk_selector")
                 .selected_text(if self.disk.is_empty() {
-                    "All devices"
+                    "All devices".to_owned()
+                } else if unavailable {
+                    format!("{} (unavailable)", self.disk)
                 } else {
-                    &self.disk
+                    self.disk.clone()
                 })
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut self.disk, String::new(), "All devices");
+                    if unavailable {
+                        let name = self.disk.clone();
+                        ui.selectable_value(
+                            &mut self.disk,
+                            name.clone(),
+                            format!("{name} (unavailable)"),
+                        );
+                    }
                     for d in &s.disks {
                         ui.selectable_value(&mut self.disk, d.name.clone(), &d.name);
                     }
@@ -895,19 +938,28 @@ impl Loadpeek {
     }
 
     fn network(&mut self, ui: &mut Ui, s: &Snapshot) {
-        if !self.network.is_empty() && !s.networks.iter().any(|d| d.name == self.network) {
-            self.network.clear();
-        }
+        let unavailable =
+            !self.network.is_empty() && !s.networks.iter().any(|d| d.name == self.network);
         ui.horizontal_wrapped(|ui| {
             let label = ui.label("Interface");
             egui::ComboBox::from_id_salt("network_selector")
                 .selected_text(if self.network.is_empty() {
-                    "All interfaces"
+                    "All interfaces".to_owned()
+                } else if unavailable {
+                    format!("{} (unavailable)", self.network)
                 } else {
-                    &self.network
+                    self.network.clone()
                 })
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut self.network, String::new(), "All interfaces");
+                    if unavailable {
+                        let name = self.network.clone();
+                        ui.selectable_value(
+                            &mut self.network,
+                            name.clone(),
+                            format!("{name} (unavailable)"),
+                        );
+                    }
                     for n in &s.networks {
                         ui.selectable_value(&mut self.network, n.name.clone(), &n.name);
                     }
@@ -1080,16 +1132,21 @@ impl Loadpeek {
 }
 
 impl eframe::App for Loadpeek {
-    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
+    fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // eframe calls logic even while the window is hidden, keeping the
+        // bounded channel drained and the full history current when minimized.
         while let Ok(sample) = self.samples.try_recv() {
-            if !self.paused {
+            if !self.paused && sample.generation == self.generation {
                 self.history.push(sample.at, sample.snapshot);
                 // The process list is a current view, not a 60-second archive
                 // of thousands of command lines.
                 self.processes = sample.processes;
             }
         }
+    }
+
+    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
         ctx.input_mut(|input| {
             for (key, page) in [
                 egui::Key::Num1,
@@ -1445,6 +1502,252 @@ fn uptime(seconds: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eframe::App;
+    use std::sync::{Arc, Mutex};
+
+    fn test_app() -> (Loadpeek, mpsc::SyncSender<Sample>, mpsc::Receiver<Command>) {
+        let (sample_tx, samples) = mpsc::sync_channel(2);
+        let (commands, command_rx) = mpsc::channel();
+        (
+            Loadpeek {
+                page: Page::Summary,
+                history: History::default(),
+                samples,
+                commands,
+                settings: Settings::default(),
+                paused: false,
+                generation: 0,
+                settings_open: false,
+                notices_open: false,
+                config_notice: None,
+                disk: String::new(),
+                network: String::new(),
+                core_filter: String::new(),
+                processes: ProcessSnapshot::default(),
+                process_view: ProcessView::default(),
+            },
+            sample_tx,
+            command_rx,
+        )
+    }
+
+    fn tick_logic(app: &mut Loadpeek, ctx: &egui::Context) {
+        let _ = ctx.run_logic(&egui::RawInput::default(), |ctx| {
+            app.logic(ctx, &mut eframe::Frame::_new_kittest());
+        });
+    }
+
+    #[test]
+    fn hidden_window_logic_keeps_history_current_and_pause_frozen() {
+        let (mut app, sample_tx, _commands) = test_app();
+        let ctx = egui::Context::default();
+        for index in 0..6 {
+            sample_tx
+                .try_send(Sample {
+                    generation: 0,
+                    at: f64::from(index),
+                    snapshot: Snapshot {
+                        cpu_percent: Some(f64::from(index)),
+                        ..Snapshot::default()
+                    },
+                    processes: ProcessSnapshot {
+                        warnings: vec![index.to_string()],
+                        ..ProcessSnapshot::default()
+                    },
+                })
+                .unwrap();
+            // Hidden windows tick logic without ever constructing a UI frame.
+            tick_logic(&mut app, &ctx);
+        }
+        assert_eq!(app.history.len(), 6);
+        assert_eq!(app.history.latest_time(), 5.0);
+        assert_eq!(app.processes.warnings, ["5"]);
+
+        app.toggle_pause();
+        sample_tx
+            .try_send(Sample {
+                generation: 0,
+                at: 6.0,
+                snapshot: Snapshot::default(),
+                processes: ProcessSnapshot::default(),
+            })
+            .unwrap();
+        tick_logic(&mut app, &ctx);
+        assert_eq!(app.history.len(), 6);
+        assert_eq!(app.history.latest_time(), 5.0);
+        assert_eq!(app.processes.warnings, ["5"]);
+    }
+
+    #[test]
+    fn resume_rejects_inflight_samples_and_uses_fresh_collector() {
+        let (mut app, sample_tx, command_rx) = test_app();
+        let ctx = egui::Context::default();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let releases = Arc::new(Mutex::new(release_rx));
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut created = 0;
+            collect_samples(
+                5.0,
+                sample_tx,
+                command_rx,
+                || {
+                    let ordinal = created;
+                    created += 1;
+                    let started_tx = started_tx.clone();
+                    let releases = Arc::clone(&releases);
+                    move || {
+                        started_tx.send(ordinal).unwrap();
+                        releases
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(5))
+                            .unwrap();
+                        (
+                            Snapshot {
+                                hostname: format!("collector {ordinal}"),
+                                cpu_percent: (ordinal == 0).then_some(80.0),
+                                ..Snapshot::default()
+                            },
+                            ProcessSnapshot {
+                                warnings: vec![format!("collector {ordinal}")],
+                                ..ProcessSnapshot::default()
+                            },
+                        )
+                    }
+                },
+                || ready_tx.send(()).unwrap(),
+            );
+        });
+
+        // Pause and resume while the old collector is blocked inside sampling.
+        assert_eq!(started_rx.recv_timeout(Duration::from_secs(5)).unwrap(), 0);
+        app.toggle_pause();
+        app.toggle_pause();
+        release_tx.send(()).unwrap();
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // Keep the fresh collector blocked until the old result is consumed.
+        assert_eq!(started_rx.recv_timeout(Duration::from_secs(5)).unwrap(), 1);
+        tick_logic(&mut app, &ctx);
+        assert_eq!(app.history.len(), 0);
+        assert!(app.processes.warnings.is_empty());
+
+        release_tx.send(()).unwrap();
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        tick_logic(&mut app, &ctx);
+        assert_eq!(app.history.len(), 1);
+        let current = app.history.latest().unwrap();
+        assert_eq!(current.hostname, "collector 1");
+        assert_eq!(current.cpu_percent, None);
+        assert_eq!(app.processes.warnings, ["collector 1"]);
+        drop(app);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn resume_and_missing_readings_preserve_device_and_interface_selection() {
+        for page in [Page::Disk, Page::Network] {
+            let (mut app, _sample_tx, _commands) = test_app();
+            app.page = page;
+            app.disk = "sda".into();
+            app.network = "eth0".into();
+            app.paused = true;
+            app.history.push(0.0, Snapshot::default());
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            crate::theme::apply(&ctx);
+            let mut draw = |snapshot: Option<Snapshot>, resume| {
+                if let Some(snapshot) = snapshot {
+                    app.history.push(app.history.latest_time() + 1.0, snapshot);
+                }
+                let events = if resume {
+                    vec![egui::Event::Key {
+                        key: egui::Key::P,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::ALT,
+                    }]
+                } else {
+                    Vec::new()
+                };
+                let output = ctx.run_ui(
+                    egui::RawInput {
+                        events,
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1000.0, 800.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| app.ui(ui, &mut eframe::Frame::_new_kittest()),
+                );
+                assert_eq!(app.disk, "sda");
+                assert_eq!(app.network, "eth0");
+                let name = if page == Page::Disk { "sda" } else { "eth0" };
+                let expected = if app.history.latest().is_some_and(|snapshot| {
+                    if page == Page::Disk {
+                        snapshot.disks.iter().any(|disk| disk.name == name)
+                    } else {
+                        snapshot.networks.iter().any(|network| network.name == name)
+                    }
+                }) {
+                    name.to_owned()
+                } else {
+                    format!("{name} (unavailable)")
+                };
+                assert!(
+                    output
+                        .platform_output
+                        .accesskit_update
+                        .as_ref()
+                        .unwrap()
+                        .nodes
+                        .iter()
+                        .any(|(_, node)| node.role() == egui::accesskit::Role::ComboBox
+                            && node.value() == Some(expected.as_str()))
+                );
+                output.drop_without_applying_deltas();
+            };
+            // Resume renders before the first new reading is ready.
+            draw(None, true);
+            // A valid reading for another device must not change the scope.
+            draw(
+                Some(Snapshot {
+                    disks: vec![crate::metrics::Disk {
+                        name: "sdb".into(),
+                        read_bytes_per_sec: Some(200.0),
+                        ..Default::default()
+                    }],
+                    networks: vec![crate::metrics::Network {
+                        name: "eth1".into(),
+                        received_bytes_per_sec: Some(300.0),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                false,
+            );
+            draw(Some(Snapshot::default()), false);
+            // The selected device can return without requiring reselection.
+            draw(
+                Some(Snapshot {
+                    disks: vec![crate::metrics::Disk {
+                        name: "sda".into(),
+                        ..Default::default()
+                    }],
+                    networks: vec![crate::metrics::Network {
+                        name: "eth0".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                false,
+            );
+        }
+    }
+
     #[test]
     fn aggregation_does_not_silently_report_partial_totals() {
         assert_eq!(sum_rates([Some(2.0), Some(3.0)].into_iter()), Some(5.0));

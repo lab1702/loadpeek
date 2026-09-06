@@ -253,6 +253,9 @@ fn inspect_history(
                 .map_or(0, |(index, _)| index);
         }
     }
+    if response.gained_focus() {
+        response.scroll_to_me(None);
+    }
     if response.has_focus() {
         ui.memory_mut(|memory| {
             memory.set_focus_lock_filter(
@@ -524,6 +527,79 @@ mod tests {
         assert_eq!(format_value(3400.0, "MHz"), "3.40 GHz");
         assert_eq!(format_value(0.0, "B/s"), "0 B/s");
         assert_eq!(format_value(f64::NAN, "%"), "Unavailable");
+    }
+
+    #[test]
+    fn tab_navigation_scrolls_focused_charts_into_view() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let series = [sample(vec![[-10.0, 12.0], [0.0, 42.0]])];
+        let mut frame_number = 0;
+        let mut frame = |tab: Option<egui::Modifiers>| {
+            let events = tab
+                .into_iter()
+                .flat_map(|modifiers| {
+                    [true, false].map(|pressed| egui::Event::Key {
+                        key: egui::Key::Tab,
+                        physical_key: None,
+                        pressed,
+                        repeat: false,
+                        modifiers,
+                    })
+                })
+                .collect();
+            let mut viewport = Rect::NOTHING;
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 200.0))),
+                    time: Some(f64::from(frame_number) / 60.0),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    viewport = egui::ScrollArea::vertical()
+                        .id_salt("chart_navigation")
+                        .max_height(180.0)
+                        .show(ui, |ui| {
+                            for index in 0..5 {
+                                show(ui, index, &series, 78.0, Some(100.0), "%");
+                            }
+                        })
+                        .inner_rect;
+                },
+            )
+            .drop_without_applying_deltas();
+            frame_number += 1;
+            viewport
+        };
+
+        frame(None);
+        let mut visited = Vec::new();
+        // Visit every chart, including those initially below the viewport, then
+        // return to the first. Allow normal scroll animation to settle each time.
+        for (step, modifiers) in [egui::Modifiers::NONE; 5]
+            .into_iter()
+            .chain([egui::Modifiers::SHIFT; 4])
+            .enumerate()
+        {
+            frame(Some(modifiers));
+            let mut viewport = Rect::NOTHING;
+            for _ in 0..60 {
+                viewport = frame(None);
+            }
+            let focused = ctx.memory(|memory| memory.focused()).unwrap();
+            if step < 5 {
+                assert!(!visited.contains(&focused));
+                visited.push(focused);
+            } else {
+                assert_eq!(focused, visited[8 - step]);
+            }
+            let chart = ctx.read_response(focused).unwrap().rect;
+            assert!(
+                chart.top() >= viewport.top() - 1.0 && chart.bottom() <= viewport.bottom() + 1.0,
+                "focused chart {chart:?} is outside scroll viewport {viewport:?}"
+            );
+        }
     }
 
     #[test]

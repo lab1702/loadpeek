@@ -55,7 +55,7 @@ Layouts reduce their column count as space narrows. Detail pages scroll when the
 
 Choose a refresh interval in the toolbar from **0.5 to 5.0 seconds**, in **0.5-second steps**. The default is one second. Collection runs outside the UI thread.
 
-Charts cover the last **60 real seconds**, independent of the chosen refresh rate. History starts empty and fills as the application collects measurements; it is not loaded from before launch. CPU utilization and throughput need two valid readings, so their first sample has no rate. Missing readings and counter resets create gaps instead of zero-valued activity.
+Charts cover the last **60 real seconds**, independent of the chosen refresh rate. Collection and history updates continue while the window is minimized. History starts empty and fills as the application collects measurements; it is not loaded from before launch. CPU utilization and throughput need two valid readings, so their first sample has no rate. Missing readings and counter resets create gaps instead of zero-valued activity.
 
 **Pause** freezes collection and the displayed history. **Resume** starts a fresh history and primes rate counters again. Closing the application discards history.
 
@@ -114,9 +114,11 @@ Disk counters come from `/proc/diskstats`. Sectors are always converted using 51
 
 Network counters come from `/proc/net/dev`; loopback is excluded. “All interfaces” sums interface traffic, including virtual interfaces. A bridge, VPN, or virtual adapter can observe traffic also counted on another interface, so that sum is not necessarily unique external traffic. Select a specific interface when you need its rate. “Up” primarily reflects the interface's administrative `IFF_UP` flag and does not guarantee Internet connectivity.
 
+A selected disk or network interface stays selected across pause/resume and missing readings. Its selector shows “unavailable” until it returns; choose “All devices” or “All interfaces” to switch back to combined traffic.
+
 ### Temperatures and unavailable data
 
-Temperatures come from `/sys/class/hwmon`, with thermal-zone readings used to fill gaps. Driver labels identify channels, and critical limits appear only when reported. The CPU headline is the hottest sensor recognized as belonging to the CPU; recognition depends on driver and channel names. Known duplicate thermal-zone/hwmon readings are skipped, while independent sensors with equal temperatures are retained. See the [hwmon interface](https://docs.kernel.org/hwmon/sysfs-interface.html).
+Temperatures come from `/sys/class/hwmon`, with thermal-zone readings used to fill gaps. Driver labels identify channels, and critical limits appear only when reported. Faulted sensor readings are omitted with an availability notice. PECI control targets (Tcontrol, Tthrottle, and Tjmax) are excluded from measured temperatures. The CPU headline is the hottest sensor recognized as belonging to the CPU; recognition depends on driver and channel names. Known duplicate thermal-zone/hwmon readings are skipped, while independent sensors with equal temperatures are retained. See the [hwmon interface](https://docs.kernel.org/hwmon/sysfs-interface.html) and [PECI channel definitions](https://docs.kernel.org/hwmon/peci-cputemp.html#sysfs-interface).
 
 Some VMs, containers, and hardware drivers do not expose clocks, disks, network interfaces, or temperatures. Loadpeek shows unavailable values and collection notices while continuing to display other measurements. Container views can also mix host-wide and namespace-specific counters; Loadpeek does not reinterpret those values as container resource quotas.
 

@@ -408,7 +408,9 @@ fn format_command(bytes: Option<&[u8]>, name: &str) -> String {
     let truncated = bytes.len() > MAX_PROC_FILE_BYTES as usize;
     let bytes = &bytes[..bytes.len().min(MAX_PROC_FILE_BYTES as usize)];
     let mut args: Vec<_> = bytes.split(|byte| *byte == 0).collect();
-    while args.last().is_some_and(|arg| arg.is_empty()) {
+    // A terminal NUL adds one synthetic split field. Earlier empty fields are
+    // real empty arguments, including arguments at the end of the command.
+    if args.last().is_some_and(|arg| arg.is_empty()) {
         args.pop();
     }
     let mut command = args
@@ -665,6 +667,39 @@ mod tests {
         let command = format_command(Some(&long), "long");
         assert!(command.ends_with(" …"));
         assert_eq!(command.chars().count(), MAX_PROC_FILE_BYTES as usize + 2);
+    }
+
+    #[test]
+    fn command_preserves_empty_arguments_without_inventing_a_terminal_one() {
+        for (bytes, expected) in [
+            (b"tool\0value\0\0".as_slice(), "tool value \"\""),
+            (b"tool\0\0\0".as_slice(), "tool \"\" \"\""),
+            (b"tool\0\0value\0".as_slice(), "tool \"\" value"),
+            (b"tool\0value\0".as_slice(), "tool value"),
+            (b"tool\0".as_slice(), "tool"),
+            (b"tool".as_slice(), "tool"),
+            (b"tool\0\0value".as_slice(), "tool \"\" value"),
+        ] {
+            assert_eq!(format_command(Some(bytes), "tool"), expected);
+        }
+    }
+
+    #[test]
+    fn truncated_command_preserves_complete_empty_arguments_at_the_limit() {
+        let prefix = "x".repeat(MAX_PROC_FILE_BYTES as usize - 2);
+        let mut bytes = prefix.as_bytes().to_vec();
+        bytes.extend_from_slice(b"\0\0tail\0");
+        assert_eq!(
+            format_command(Some(&bytes), "tool"),
+            format!("{prefix} \"\" …")
+        );
+
+        // A separator at the limit should not create an empty argument for
+        // the omitted argument that follows it.
+        let prefix = "x".repeat(MAX_PROC_FILE_BYTES as usize - 1);
+        let mut bytes = prefix.as_bytes().to_vec();
+        bytes.extend_from_slice(b"\0tail\0");
+        assert_eq!(format_command(Some(&bytes), "tool"), format!("{prefix} …"));
     }
 
     #[test]

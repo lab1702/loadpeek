@@ -596,6 +596,7 @@ fn discover_sensors(sys_root: &Path, warnings: &mut Vec<String>) -> Vec<Sensor> 
             let root = entry.path();
             let driver = read_trimmed(root.join("name"))
                 .unwrap_or_else(|| entry.file_name().to_string_lossy().into_owned());
+            let is_peci_cpu = driver == "peci_cputemp" || driver.starts_with("peci_cputemp.");
             // Some older drivers expose attributes under hwmonN/device.
             for directory in [root.clone(), root.join("device")] {
                 let Ok(attributes) = fs::read_dir(&directory) else {
@@ -610,6 +611,11 @@ fn discover_sensors(sys_root: &Path, warnings: &mut Vec<String>) -> Vec<Sensor> 
                     }) else {
                         continue;
                     };
+                    // PECI channels 3–5 expose Tcontrol, Tthrottle, and Tjmax
+                    // targets through _input files, rather than measurements.
+                    if is_peci_cpu && matches!(channel, "temp3" | "temp4" | "temp5") {
+                        continue;
+                    }
                     let path = attribute.path();
                     let canonical = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
                     if !sources.insert(canonical.clone()) {
@@ -618,6 +624,14 @@ fn discover_sensors(sys_root: &Path, warnings: &mut Vec<String>) -> Vec<Sensor> 
                     if read_trimmed(directory.join(format!("{channel}_enable"))).as_deref()
                         == Some("0")
                     {
+                        continue;
+                    }
+                    // A plausible input value is still invalid when the driver
+                    // reports a disconnected or otherwise faulted sensor.
+                    if read_trimmed(directory.join(format!("{channel}_fault"))).as_deref()
+                        == Some("1")
+                    {
+                        inaccessible += 1;
                         continue;
                     }
                     let Some(celsius) = read_temperature(&path) else {
@@ -915,5 +929,76 @@ mod tests {
         let mut warnings = Vec::new();
         assert!(discover_sensors(&fixture.0, &mut warnings).is_empty());
         assert_eq!(warnings.len(), 1);
+    }
+
+    #[test]
+    fn faulted_temperature_channels_are_missing_until_the_fault_clears() {
+        for directory in ["class/hwmon/hwmon0", "class/hwmon/hwmon0/device"] {
+            let fixture = Fixture::new();
+            fixture.write("class/hwmon/hwmon0/name", "max6697");
+            fixture.write(&format!("{directory}/temp1_input"), "42000");
+            fixture.write(&format!("{directory}/temp2_input"), "43000");
+            fixture.write(&format!("{directory}/temp2_fault"), "0");
+            let mut warnings = Vec::new();
+            assert_eq!(discover_sensors(&fixture.0, &mut warnings).len(), 2);
+            assert!(warnings.is_empty());
+
+            fixture.write(&format!("{directory}/temp2_input"), "127000");
+            fixture.write(&format!("{directory}/temp2_fault"), "1");
+            let sensors = discover_sensors(&fixture.0, &mut warnings);
+            assert_eq!(sensors.len(), 1);
+            assert_eq!(sensors[0].label, "max6697 · temp1");
+            assert_eq!(sensors[0].celsius, 42.0);
+            assert_eq!(
+                warnings,
+                ["1 temperature reading(s) were unavailable or invalid."]
+            );
+
+            fixture.write(&format!("{directory}/temp2_input"), "44000");
+            fixture.write(&format!("{directory}/temp2_fault"), "0");
+            warnings.clear();
+            let sensors = discover_sensors(&fixture.0, &mut warnings);
+            assert_eq!(sensors.len(), 2);
+            assert_eq!(sensors[1].label, "max6697 · temp2");
+            assert_eq!(sensors[1].celsius, 44.0);
+            assert!(warnings.is_empty());
+        }
+    }
+
+    #[test]
+    fn peci_control_targets_are_excluded_but_measurements_and_limits_remain() {
+        let fixture = Fixture::new();
+        fixture.write("class/hwmon/hwmon0/name", "peci_cputemp.cpu0");
+        for (channel, label, value) in [
+            (1, "Die", "40000"),
+            (2, "DTS", "42000"),
+            (3, "Tcontrol", "80000"),
+            (4, "Tthrottle", "90000"),
+            (5, "Tjmax", "100000"),
+            (6, "Core 0", "41000"),
+        ] {
+            fixture.write(&format!("class/hwmon/hwmon0/temp{channel}_label"), label);
+            fixture.write(&format!("class/hwmon/hwmon0/temp{channel}_input"), value);
+        }
+        fixture.write("class/hwmon/hwmon0/temp1_crit", "100000");
+        // Other drivers use these channel numbers for actual measurements.
+        fixture.write("class/hwmon/hwmon1/name", "coretemp");
+        fixture.write("class/hwmon/hwmon1/temp3_label", "Core 1");
+        fixture.write("class/hwmon/hwmon1/temp3_input", "43000");
+        let mut warnings = Vec::new();
+        let sensors = discover_sensors(&fixture.0, &mut warnings);
+        assert_eq!(sensors.len(), 4);
+        assert!(sensors.iter().all(|sensor| sensor.is_cpu));
+        assert_eq!(
+            sensors.iter().map(|sensor| sensor.celsius).reduce(f64::max),
+            Some(43.0)
+        );
+        let die = sensors
+            .iter()
+            .find(|sensor| sensor.label == "peci_cputemp.cpu0 · Die")
+            .unwrap();
+        assert_eq!(die.celsius, 40.0);
+        assert_eq!(die.critical_celsius, Some(100.0));
+        assert!(warnings.is_empty());
     }
 }
