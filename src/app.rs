@@ -583,19 +583,33 @@ impl Loadpeek {
                             }
                             _ => {
                                 self.card_title(ui, "System load", YELLOW, Page::Cpu);
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 24.0;
                                     for (i, label) in
                                         ["1 min", "5 min", "15 min"].into_iter().enumerate()
                                     {
-                                        ui.vertical(|ui| {
-                                            ui.label(
-                                                RichText::new(number(s.load[i], 2))
-                                                    .size(27.0)
-                                                    .color(TEXT),
-                                            );
-                                            small(ui, label);
-                                        });
-                                        ui.add_space(24.0);
+                                        let mut text = egui::text::LayoutJob::default();
+                                        text.append(
+                                            &number(s.load[i], 2),
+                                            0.0,
+                                            egui::TextFormat {
+                                                font_id: FontId::proportional(27.0),
+                                                color: TEXT,
+                                                ..Default::default()
+                                            },
+                                        );
+                                        text.append(
+                                            &format!("\n{label}"),
+                                            0.0,
+                                            egui::TextFormat {
+                                                font_id: FontId::proportional(12.0),
+                                                color: SUBTEXT,
+                                                ..Default::default()
+                                            },
+                                        );
+                                        // Move complete groups to the next row without
+                                        // wrapping inside a number or its time label.
+                                        ui.add(egui::Label::new(text).extend());
                                     }
                                 });
                                 ui.add_space(7.0);
@@ -893,7 +907,7 @@ impl Loadpeek {
                 })
                 .response
                 .labelled_by(label.id);
-            small(ui, "Whole leaf block devices · partitions excluded");
+            small(ui, "Whole block devices · duplicate layers excluded");
         });
         ui.add_space(16.0);
         card(ui, |ui| {
@@ -1871,6 +1885,188 @@ mod tests {
     fn absent_memory_is_not_zero_percent() {
         assert_eq!(memory_percent(&Snapshot::default()), None);
     }
+
+    #[test]
+    fn cpu_history_selection_and_focus_survive_responsive_layouts() {
+        use egui::accesskit::{Action, ActionData, ActionRequest, Role, TreeId};
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        crate::theme::apply(&ctx);
+        let (mut app, _samples, _commands) = test_app();
+        app.page = Page::Cpu;
+        for at in [0.0, 1.0, 2.0] {
+            app.history.push(
+                at,
+                Snapshot {
+                    cpu_percent: Some(at),
+                    ..Snapshot::default()
+                },
+            );
+        }
+        let mut frame = |width, events| {
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 1000.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.ui(ui, &mut eframe::Frame::_new_kittest()),
+            );
+            let (id, node) = output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .unwrap()
+                .nodes
+                .iter()
+                .find(|(_, node)| {
+                    node.role() == Role::Slider
+                        && node
+                            .label()
+                            .is_some_and(|name| name.starts_with("CPU, 60-second history"))
+                })
+                .unwrap();
+            let result = (
+                *id,
+                node.numeric_value().unwrap(),
+                node.value().unwrap().to_owned(),
+            );
+            output.drop_without_applying_deltas();
+            result
+        };
+        for _ in 0..4 {
+            frame(1440.0, Vec::new());
+        }
+        let before = frame(1440.0, Vec::new());
+        let request = |action, data| {
+            egui::Event::AccessKitActionRequest(ActionRequest {
+                action,
+                target_tree: TreeId::ROOT,
+                target_node: before.0,
+                data,
+            })
+        };
+        let selected = frame(
+            1440.0,
+            vec![
+                request(Action::Focus, None),
+                request(Action::SetValue, Some(ActionData::NumericValue(0.0))),
+            ],
+        );
+        assert_eq!(selected.1, 0.0);
+        let focus = ctx.memory(|memory| memory.focused());
+        assert!(focus.is_some());
+
+        // Switch columns to stacked cards, remove the sidebar, then restore it.
+        for width in [1000.0, 640.0, 1440.0] {
+            for _ in 0..4 {
+                let resized = frame(width, Vec::new());
+                assert_eq!(resized, selected, "{width}: selected observation changed");
+                assert_eq!(ctx.memory(|memory| memory.focused()), focus);
+            }
+        }
+        let next = frame(
+            1440.0,
+            vec![egui::Event::Key {
+                key: egui::Key::ArrowRight,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(next.0, selected.0);
+        assert_eq!(next.1, 1.0);
+        assert!(next.2.contains("CPU: 1.0%"));
+    }
+
+    #[test]
+    fn summary_load_values_stay_intact_at_supported_sizes() {
+        for size in [
+            egui::vec2(320.0, 240.0),
+            egui::vec2(640.0, 480.0),
+            egui::vec2(1000.0, 800.0),
+            egui::vec2(1440.0, 1000.0),
+        ] {
+            for load in [[12.34, 23.45, 34.56], [123.45, 234.56, 345.67]] {
+                let expected = load.map(|value| number(value, 2));
+                let (mut app, _samples, _commands) = test_app();
+                app.history.push(
+                    0.0,
+                    Snapshot {
+                        load,
+                        ..Snapshot::default()
+                    },
+                );
+                let ctx = egui::Context::default();
+                crate::theme::apply(&ctx);
+                let mut seen = [false; 3];
+                for frame in 0..80 {
+                    let mut events = vec![egui::Event::PointerMoved(size.to_pos2() * 0.5)];
+                    if frame >= 4 {
+                        events.push(egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta: egui::vec2(0.0, -96.0),
+                            phase: egui::TouchPhase::Move,
+                            modifiers: egui::Modifiers::NONE,
+                        });
+                    }
+                    let output = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                            time: Some(f64::from(frame) / 10.0),
+                            events,
+                            ..Default::default()
+                        },
+                        |ui| app.ui(ui, &mut eframe::Frame::_new_kittest()),
+                    );
+                    if frame >= 3 {
+                        for clipped in &output.shapes {
+                            let egui::Shape::Text(text) = &clipped.shape else {
+                                continue;
+                            };
+                            let rect = text.galley.rect.translate(text.pos.to_vec2());
+                            if !clipped.clip_rect.intersects(rect) {
+                                continue;
+                            }
+                            let first_line = text.galley.job.text.lines().next();
+                            let Some(index) = expected
+                                .iter()
+                                .position(|value| Some(value.as_str()) == first_line)
+                            else {
+                                continue;
+                            };
+                            // A grouped label may add one explicit line below the number.
+                            // Neither its number nor its caption may wrap internally.
+                            assert_eq!(
+                                text.galley.rows.len(),
+                                text.galley.job.text.lines().count(),
+                                "{size:?}: {} wraps inside a value or caption",
+                                expected[index]
+                            );
+                            assert!(
+                                rect.left() >= clipped.clip_rect.left() - 1.0
+                                    && rect.right() <= clipped.clip_rect.right() + 1.0,
+                                "{size:?}: {} is clipped horizontally",
+                                expected[index]
+                            );
+                            seen[index] = true;
+                        }
+                    }
+                    output.drop_without_applying_deltas();
+                    if seen.iter().all(|visible| *visible) {
+                        break;
+                    }
+                }
+                assert_eq!(seen, [true; 3], "{size:?}: load values were unreachable");
+            }
+        }
+    }
+
     #[test]
     fn binary_units_and_uptime() {
         assert_eq!(bytes(1024.0 * 1024.0), "1.0 MiB");

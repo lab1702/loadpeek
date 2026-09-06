@@ -54,7 +54,7 @@ For runtime troubleshooting, Debian provides [libgl1](https://packages.debian.or
 | **Summary** | The first page: CPU utilization and minimum/average/maximum clock, RAM usage, disk read/write, network in/out, CPU temperature, load averages, and uptime. Each card opens its detail page. |
 | **CPU** | Overall utilization, minimum/average/maximum clock history, 1/5/15-minute load averages, and a utilization chart plus current clock for every online logical core. A core filter helps on large systems. |
 | **Memory** | RAM and swap utilization histories, total memory, available memory, used memory, and reclaimable cache. |
-| **Disk** | Combined or selected-device read/write history, current rates, and lifetime counters for each detected whole leaf block device. |
+| **Disk** | Combined or selected-device read/write history, current rates, and lifetime counters for detected whole block devices, with duplicate accounting layers excluded. |
 | **Network** | Combined or selected-interface incoming/outgoing history, current rates, interface state, and lifetime byte counters. |
 | **Thermals** | The hottest recognized CPU sensor and individual hardware temperature histories, with critical thresholds when the driver reports them. |
 | **Processes** | A sortable, filterable process table with PID, user, priority, nice value, virtual/resident/shared memory, state, CPU%, memory%, CPU time, and command. Select a row for full process details. |
@@ -67,7 +67,7 @@ Choose a refresh interval in the toolbar from **0.5 to 5.0 seconds**, in **0.5-s
 
 Charts cover the last **60 real seconds**, independent of the chosen refresh rate. Collection and history updates continue while the window is minimized. History starts empty and fills as the application collects measurements; it is not loaded from before launch. CPU utilization and throughput need two valid readings, so their first sample has no rate. Missing readings and counter resets create gaps instead of zero-valued activity.
 
-Chart inspection keeps the selected observation as new samples arrive. When that observation expires, selection moves to the oldest remaining point.
+Chart inspection keeps the selected observation as new samples arrive and preserves selection and keyboard focus when resizing rearranges the charts. When that observation expires, selection moves to the oldest remaining point.
 
 **Pause** freezes collection and the displayed history. **Resume** starts a fresh history and primes rate counters again. Closing the application discards history.
 
@@ -122,7 +122,7 @@ Used RAM is `MemTotal − MemAvailable`. Available RAM includes memory the kerne
 
 Read/write and incoming/outgoing rates are counter deltas divided by the actual elapsed monotonic time, in **bytes per second**. Displayed KiB, MiB, and GiB use powers of 1,024. Rates are interval averages, so brief bursts between samples are smoothed. Decreasing counters, new devices, and an unreadable source require a fresh baseline before rates resume.
 
-Disk counters come from `/proc/diskstats`. Sectors are always converted using 512 bytes, regardless of the device's physical sector size. Discovery through `/sys/block` excludes partitions, loop devices, RAM disks, zram, and stacked devices with slaves. This measures the underlying whole devices without summing a partition or LVM/RAID layer again. It is disk I/O throughput, not filesystem space usage. See the kernel's [block statistics](https://docs.kernel.org/block/stat.html) and [I/O statistics fields](https://docs.kernel.org/admin-guide/iostats.html).
+Disk counters come from `/proc/diskstats`. Sectors are always converted using 512 bytes, regardless of the device's physical sector size. Discovery through `/sys/block` excludes partitions, loop devices, RAM disks, zram, stacked devices with slaves, and hidden devices. For native NVMe multipath, the visible namespace is retained and its hidden controller paths are excluded, so their shared traffic contributes once. An unreadable or invalid visibility flag omits that device with a notice; kernels without the flag retain the usual topology checks. This measures whole-device I/O without summing duplicate accounting layers. It is disk I/O throughput, not filesystem space usage. See the kernel's [block statistics](https://docs.kernel.org/block/stat.html) and [I/O statistics fields](https://docs.kernel.org/admin-guide/iostats.html).
 
 Disk generations from `/sys/block/<device>/diskseq` distinguish replacement drives that reuse a device name. Identity is checked before and after reading counters; a replacement needs a fresh rate baseline. If the kernel or sysfs view does not expose a valid disk generation, lifetime counters remain visible, rates are unavailable, and a notice explains why.
 

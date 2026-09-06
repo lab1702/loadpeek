@@ -683,6 +683,27 @@ fn leaf_block_devices(sys_root: &Path, warnings: &mut Vec<String>) -> Option<BTr
         {
             continue;
         }
+        // Native NVMe multipath accounts I/O on both its visible namespace
+        // and hidden path disks, without linking them through slaves/. Keep
+        // the namespace's counters once, including on kernels predating the
+        // newer multipath/ topology links.
+        match fs::read_to_string(entry.path().join("hidden")) {
+            Ok(hidden) => match hidden.trim() {
+                "0" => {}
+                "1" => continue,
+                _ => {
+                    warnings.push(format!(
+                        "Cannot inspect {name} disk visibility: invalid hidden flag."
+                    ));
+                    continue;
+                }
+            },
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                warnings.push(format!("Cannot inspect {name} disk visibility: {error}"));
+                continue;
+            }
+            _ => {}
+        }
         // Whole-device entries exclude partitions. Stacked DM/MD devices repeat
         // I/O already accounted by their slave disks, so only retain leaf devices.
         match fs::read_dir(entry.path().join("slaves")) {
@@ -1174,6 +1195,89 @@ mod tests {
         fixture.write("block/zram0/stat", "");
         let devices = leaf_block_devices(&fixture.0, &mut Vec::new()).unwrap();
         assert_eq!(devices, BTreeSet::from(["nvme0n1".to_owned()]));
+    }
+
+    #[test]
+    fn native_nvme_multipath_counts_one_layer_and_keeps_ordinary_nvme() {
+        let fixture = Fixture::new();
+        for (name, diskseq, hidden) in [
+            ("nvme0n1", "10", "0"),
+            ("nvme0c0n1", "11", "1"),
+            ("nvme0c1n1", "12", "1"),
+            ("nvme1n1", "13", "0"),
+        ] {
+            fixture.write(&format!("sys/block/{name}/diskseq"), diskseq);
+            fixture.write(&format!("sys/block/{name}/hidden"), hidden);
+            fs::create_dir_all(fixture.0.join(format!("sys/block/{name}/slaves"))).unwrap();
+        }
+        // Native multipath does not populate slaves/. Both the visible
+        // namespace and its hidden paths account for the same requests.
+        fixture.write(
+            "proc/diskstats",
+            "259 0 nvme0n1 1 0 1000 0 1 0 500 0 0 0 0\n\
+             259 1 nvme0c0n1 1 0 400 0 1 0 200 0 0 0 0\n\
+             259 2 nvme0c1n1 1 0 600 0 1 0 300 0 0 0 0\n\
+             259 3 nvme1n1 1 0 100 0 1 0 100 0 0 0 0",
+        );
+        let mut collector = Collector::with_roots(fixture.0.join("proc"), fixture.0.join("sys"));
+        let mut warnings = Vec::new();
+        let before = collector.sample_disks(&mut warnings);
+        assert_eq!(
+            before
+                .iter()
+                .map(|disk| disk.name.as_str())
+                .collect::<Vec<_>>(),
+            ["nvme0n1", "nvme1n1"]
+        );
+        assert!(before.iter().all(|disk| disk.read_bytes_per_sec.is_none()));
+        fixture.write(
+            "proc/diskstats",
+            "259 0 nvme0n1 1 0 1200 0 1 0 600 0 0 0 0\n\
+             259 1 nvme0c0n1 1 0 500 0 1 0 250 0 0 0 0\n\
+             259 2 nvme0c1n1 1 0 700 0 1 0 350 0 0 0 0\n\
+             259 3 nvme1n1 1 0 150 0 1 0 125 0 0 0 0",
+        );
+        let after = collector.sample_disks(&mut warnings);
+        let read_delta: u64 = before
+            .iter()
+            .zip(&after)
+            .map(|(before, after)| after.total_read_bytes - before.total_read_bytes)
+            .sum();
+        let write_delta: u64 = before
+            .iter()
+            .zip(&after)
+            .map(|(before, after)| after.total_write_bytes - before.total_write_bytes)
+            .sum();
+        assert_eq!(read_delta, 250 * 512);
+        assert_eq!(write_delta, 125 * 512);
+        let read_rate: f64 = after
+            .iter()
+            .map(|disk| disk.read_bytes_per_sec.unwrap())
+            .sum();
+        let write_rate: f64 = after
+            .iter()
+            .map(|disk| disk.write_bytes_per_sec.unwrap())
+            .sum();
+        assert!((read_rate / after[0].read_bytes_per_sec.unwrap() - 1.25).abs() < 1e-12);
+        assert!((write_rate / after[0].write_bytes_per_sec.unwrap() - 1.25).abs() < 1e-12);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn block_discovery_omits_uncertain_visibility_but_keeps_legacy_devices() {
+        let fixture = Fixture::new();
+        fixture.write("block/sda/diskseq", "1");
+        fixture.write("block/sdb/hidden", "invalid");
+        fs::create_dir_all(fixture.0.join("block/sdc/hidden")).unwrap();
+        let mut warnings = Vec::new();
+        let devices = leaf_block_devices(&fixture.0, &mut warnings).unwrap();
+        assert_eq!(devices, BTreeSet::from(["sda".to_owned()]));
+        assert_eq!(warnings.len(), 2);
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| warning.contains("disk visibility"))
+        );
     }
 
     #[test]

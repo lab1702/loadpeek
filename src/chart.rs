@@ -1,6 +1,7 @@
 //! Small, fixed-window charts. `height` includes the plot and axes; accessible
 //! legends and the current/minimum/maximum readouts are laid out beneath it.
 //! Focus or click a plot to inspect its history with Left/Right and Home/End.
+//! Chart IDs must be unique across all charts rendered in the same context.
 
 use std::hash::{DefaultHasher, Hash, Hasher};
 
@@ -56,7 +57,10 @@ pub fn show_named(
 ) {
     let mut id_hash = DefaultHasher::new();
     id.hash(&mut id_hash);
-    ui.push_id(id_hash.finish(), |ui| {
+    // Responsive layouts move charts between parents. An explicit scope keeps
+    // the plot's single interaction, keyboard focus, and cursor IDs unchanged.
+    let chart_id = egui::Id::new(("loadpeek_chart", id_hash.finish()));
+    ui.scope_builder(egui::UiBuilder::new().id(chart_id), |ui| {
         let width = ui.available_width().max(100.0);
         let (rect, mut response) =
             ui.allocate_exact_size(egui::vec2(width, height.max(78.0)), Sense::click());
@@ -672,6 +676,94 @@ mod tests {
             );
         }
         output.drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn history_controls_keep_focus_and_independent_cursors_when_reparented() {
+        use egui::accesskit::{Action, ActionData, ActionRequest, Role, TreeId};
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let series = [sample(vec![[-10.0, 12.0], [-5.0, 24.0], [0.0, 42.0]])];
+        let frame = |reparented, events| {
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    ui.push_id(if reparented { "stacked" } else { "columns" }, |ui| {
+                        if reparented {
+                            ui.label("Additional content before the charts");
+                        }
+                        for name in ["First", "Second"] {
+                            show_named(ui, name, name, &series, 78.0, Some(100.0), "%");
+                        }
+                    });
+                },
+            );
+            let mut controls: Vec<_> = output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .unwrap()
+                .nodes
+                .iter()
+                .filter(|(_, node)| node.role() == Role::Slider)
+                .map(|(id, node)| {
+                    (
+                        node.label().unwrap().to_owned(),
+                        *id,
+                        node.numeric_value().unwrap(),
+                        node.value().unwrap().to_owned(),
+                    )
+                })
+                .collect();
+            controls.sort_by(|a, b| a.0.cmp(&b.0));
+            assert_eq!(controls.len(), 2);
+            assert_ne!(controls[0].1, controls[1].1);
+            output.drop_without_applying_deltas();
+            controls
+        };
+
+        let initial = frame(false, Vec::new());
+        let action = |action, data| {
+            egui::Event::AccessKitActionRequest(ActionRequest {
+                action,
+                target_tree: TreeId::ROOT,
+                target_node: initial[0].1,
+                data,
+            })
+        };
+        let selected = frame(
+            false,
+            vec![
+                action(Action::Focus, None),
+                action(Action::SetValue, Some(ActionData::NumericValue(0.0))),
+            ],
+        );
+        assert_eq!(selected[0].2, 0.0);
+        assert_eq!(selected[1].2, 2.0);
+        let focused = ctx.memory(|memory| memory.focused());
+        assert!(focused.is_some());
+
+        let reparented = frame(true, Vec::new());
+        assert_eq!(reparented, selected);
+        assert_eq!(ctx.memory(|memory| memory.focused()), focused);
+        let moved = frame(
+            true,
+            vec![egui::Event::Key {
+                key: egui::Key::ArrowRight,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(moved[0].2, 1.0);
+        assert!(moved[0].3.contains("Test: 24.0%"));
+        assert_eq!(moved[1], selected[1]);
+        assert_eq!(ctx.memory(|memory| memory.focused()), focused);
     }
 
     #[test]
