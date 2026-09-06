@@ -114,7 +114,9 @@ pub struct Network {
     pub transmitted_bytes_per_sec: Option<f64>,
     pub total_received_bytes: u64,
     pub total_transmitted_bytes: u64,
-    pub is_up: bool,
+    /// Administrative state, with a definite operational state as a fallback.
+    /// None means the state is unknown or its source is unavailable.
+    pub is_up: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -419,6 +421,7 @@ impl Collector {
         let counters = parse_networks(&text);
         let mut next_baselines = BTreeMap::new();
         let mut unknown_identities = 0;
+        let mut unknown_states = 0;
         let networks = counters
             .iter()
             .map(|(name, current)| {
@@ -446,9 +449,16 @@ impl Collector {
                 let is_up = read_trimmed(interface.join("flags"))
                     .and_then(|text| u32::from_str_radix(text.trim_start_matches("0x"), 16).ok())
                     .map(|flags| flags & 1 != 0)
-                    .unwrap_or_else(|| {
-                        read_trimmed(interface.join("operstate")).is_some_and(|state| state == "up")
-                    });
+                    .or_else(
+                        || match read_trimmed(interface.join("operstate")).as_deref() {
+                            Some("up") => Some(true),
+                            Some("down" | "lowerlayerdown") => Some(false),
+                            _ => None,
+                        },
+                    );
+                if is_up.is_none() {
+                    unknown_states += 1;
+                }
                 Network {
                     name: name.clone(),
                     received_bytes_per_sec: previous
@@ -468,6 +478,11 @@ impl Collector {
         if unknown_identities > 0 {
             warnings.push(format!(
                 "{unknown_identities} network interface identity reading(s) were unavailable or changed during collection; their rates are unavailable."
+            ));
+        }
+        if unknown_states > 0 {
+            warnings.push(format!(
+                "{unknown_states} network interface status reading(s) were unavailable or unknown; their status is unavailable."
             ));
         }
         self.previous_networks = next_baselines;
@@ -1423,6 +1438,7 @@ mod tests {
     fn replacing_a_network_interface_requires_a_new_baseline() {
         let fixture = Fixture::new();
         fixture.write("sys/class/net/tun0/ifindex", "7");
+        fixture.write("sys/class/net/tun0/flags", "0x1");
         fixture.write(
             "proc/net/dev",
             "tun0: 1000 0 0 0 0 0 0 0 2000 0 0 0 0 0 0 0",
@@ -1460,6 +1476,8 @@ mod tests {
         let fixture = Fixture::new();
         fixture.write("sys/class/net/tun0/ifindex", "7");
         fixture.write("sys/class/net/eth0/ifindex", "2");
+        fixture.write("sys/class/net/tun0/flags", "0x1");
+        fixture.write("sys/class/net/eth0/flags", "0x1");
         fixture.write(
             "proc/net/dev",
             "tun0: 1000 0 0 0 0 0 0 0 2000 0 0 0 0 0 0 0\neth0: 3000 0 0 0 0 0 0 0 4000 0 0 0 0 0 0 0",
@@ -1510,6 +1528,84 @@ mod tests {
             assert_eq!(tun.received_bytes_per_sec, Some(0.0));
             assert_eq!(tun.transmitted_bytes_per_sec, Some(0.0));
             assert!(warnings.is_empty());
+        }
+    }
+
+    #[test]
+    fn unavailable_network_status_preserves_counters_and_recovers() {
+        let fixture = Fixture::new();
+        fixture.write("sys/class/net/tun0/ifindex", "7");
+        fixture.write(
+            "proc/net/dev",
+            "tun0: 1000 0 0 0 0 0 0 0 2000 0 0 0 0 0 0 0",
+        );
+        let mut collector = Collector::with_roots(fixture.0.join("proc"), fixture.0.join("sys"));
+        let mut warnings = Vec::new();
+        let first = collector.sample_networks(&mut warnings);
+        assert_eq!(first[0].is_up, None);
+        assert_eq!(first[0].received_bytes_per_sec, None);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("status"));
+
+        for state in [None, Some("unknown"), Some(""), Some("invalid")] {
+            if let Some(state) = state {
+                fixture.write("sys/class/net/tun0/operstate", state);
+            }
+            warnings.clear();
+            let networks = collector.sample_networks(&mut warnings);
+            let network = &networks[0];
+            assert_eq!(network.is_up, None);
+            assert_eq!(network.total_received_bytes, 1000);
+            assert_eq!(network.total_transmitted_bytes, 2000);
+            assert_eq!(network.received_bytes_per_sec, Some(0.0));
+            assert_eq!(network.transmitted_bytes_per_sec, Some(0.0));
+            assert_eq!(warnings.len(), 1);
+            assert!(warnings[0].contains("status"));
+        }
+
+        // A read error must behave like a missing state, even with valid identity.
+        fixture.write("sys/class/net/tun0/flags", "invalid");
+        fs::remove_file(fixture.0.join("sys/class/net/tun0/operstate")).unwrap();
+        fs::create_dir(fixture.0.join("sys/class/net/tun0/operstate")).unwrap();
+        warnings.clear();
+        assert_eq!(collector.sample_networks(&mut warnings)[0].is_up, None);
+        assert_eq!(warnings.len(), 1);
+
+        // Status recovery does not discard an otherwise valid rate baseline.
+        fixture.write("sys/class/net/tun0/flags", "0x1");
+        warnings.clear();
+        let recovered = collector.sample_networks(&mut warnings);
+        assert_eq!(recovered[0].is_up, Some(true));
+        assert_eq!(recovered[0].received_bytes_per_sec, Some(0.0));
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn network_status_prefers_flags_and_requires_a_definite_fallback() {
+        let fixture = Fixture::new();
+        fixture.write("sys/class/net/tun0/ifindex", "7");
+        fixture.write(
+            "proc/net/dev",
+            "tun0: 1000 0 0 0 0 0 0 0 2000 0 0 0 0 0 0 0",
+        );
+        let mut collector = Collector::with_roots(fixture.0.join("proc"), fixture.0.join("sys"));
+        for (flags, state, expected) in [
+            ("0x1", "unknown", Some(true)),
+            ("0x1", "down", Some(true)),
+            ("0x0", "up", Some(false)),
+            ("invalid", "up", Some(true)),
+            ("invalid", "down", Some(false)),
+            ("invalid", "lowerlayerdown", Some(false)),
+            ("invalid", "unknown", None),
+            ("", "dormant", None),
+            ("", "testing", None),
+        ] {
+            fixture.write("sys/class/net/tun0/flags", flags);
+            fixture.write("sys/class/net/tun0/operstate", state);
+            let mut warnings = Vec::new();
+            let networks = collector.sample_networks(&mut warnings);
+            assert_eq!(networks[0].is_up, expected, "flags={flags}, state={state}");
+            assert_eq!(warnings.len(), usize::from(expected.is_none()));
         }
     }
 

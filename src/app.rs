@@ -1042,7 +1042,12 @@ impl Loadpeek {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new(&n.name).size(19.0).strong());
                     ui.label(
-                        RichText::new(if n.is_up { "Up" } else { "Down" }).color(if n.is_up {
+                        RichText::new(match n.is_up {
+                            Some(true) => "Up",
+                            Some(false) => "Down",
+                            None => "Unavailable",
+                        })
+                        .color(if n.is_up == Some(true) {
                             GREEN
                         } else {
                             SUBTEXT
@@ -2284,6 +2289,79 @@ mod tests {
         assert_eq!(bytes(1024.0 * 1024.0), "1.0 MiB");
         assert_eq!(uptime(90061.0), "1d 1h 1m");
         assert_eq!(uptime(f64::NAN), "Unavailable");
+    }
+
+    #[test]
+    fn network_interface_status_distinguishes_unknown_from_down() {
+        use egui::accesskit::Role;
+
+        let (mut app, _samples, _commands) = test_app();
+        app.page = Page::Network;
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        crate::theme::apply(&ctx);
+        for (index, (is_up, expected, color)) in [
+            (Some(true), "Up", GREEN),
+            (Some(false), "Down", SUBTEXT),
+            (None, "Unavailable", SUBTEXT),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            app.history.push(
+                index as f64,
+                Snapshot {
+                    networks: vec![crate::metrics::Network {
+                        name: "eth0".into(),
+                        received_bytes_per_sec: Some(0.0),
+                        transmitted_bytes_per_sec: Some(0.0),
+                        is_up,
+                        ..Default::default()
+                    }],
+                    ..Snapshot::default()
+                },
+            );
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1440.0, 1000.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| app.ui(ui, &mut eframe::Frame::_new_kittest()),
+            );
+            let status_labels: Vec<_> = output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .unwrap()
+                .nodes
+                .iter()
+                .filter(|(_, node)| node.role() == Role::Label)
+                .filter_map(|(_, node)| node.value())
+                .filter(|value| matches!(*value, "Up" | "Down" | "Unavailable"))
+                .collect();
+            assert_eq!(status_labels, [expected]);
+            let status_text = output
+                .shapes
+                .iter()
+                .filter_map(|clipped| match &clipped.shape {
+                    egui::Shape::Text(text) if text.galley.job.text == expected => Some(text),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(status_text.len(), 1);
+            assert!(
+                status_text[0]
+                    .galley
+                    .job
+                    .sections
+                    .iter()
+                    .all(|section| section.format.color == color)
+            );
+            output.drop_without_applying_deltas();
+        }
     }
 
     #[test]
