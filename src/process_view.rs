@@ -239,7 +239,7 @@ impl ProcessView {
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 let mut filters_changed = false;
-                ui.horizontal_wrapped(|ui| {
+                let search = ui.horizontal_wrapped(|ui| {
                     let search_label = ui.label("Search");
                     let search = ui
                         .add(
@@ -279,7 +279,8 @@ impl ProcessView {
                             filters_changed = true;
                         }
                     }
-                });
+                    search
+                }).inner;
 
                 let mut processes = filtered_processes(snapshot, &self.query, self.state);
                 processes.sort_unstable_by(|left, right| {
@@ -305,6 +306,15 @@ impl ProcessView {
                 ui.add_space(4.0);
 
                 if processes.is_empty() {
+                    if self.focused.is_some_and(|(_, id, _)| {
+                        ui.memory(|memory| memory.has_focus(id))
+                    }) && !explicit_focus_input(ui) {
+                        // There is no surviving row to receive focus. Keep the
+                        // filters reachable without changing the inspected identity.
+                        search.request_focus();
+                        search.scroll_to_me(None);
+                        self.focused = None;
+                    }
                     ui.add_space(16.0);
                     ui.label(if snapshot.processes.is_empty() {
                         "No processes are available in the current sample."
@@ -395,10 +405,12 @@ impl ProcessView {
         let mut reveal_in_page = None;
         if let Some((key, id, previous_index)) = self.focused
             && ui.memory(|memory| memory.has_focus(id))
-            && let Some(index) = processes
-                .iter()
-                .position(|process| ProcessKey::from(*process) == key)
+            && !processes.is_empty()
         {
+            let current_index = processes
+                .iter()
+                .position(|process| ProcessKey::from(*process) == key);
+            let index = current_index.unwrap_or_else(|| previous_index.min(processes.len() - 1));
             let page_rows = (table_height / row_stride).floor() as usize;
             let next = ui.input_mut(|input| {
                 [
@@ -419,10 +431,13 @@ impl ProcessView {
                 self.selected = Some(key);
                 focus_target = Some(key);
                 scroll_target = Some(next);
-            } else if index != previous_index {
+            } else if (current_index.is_none() || index != previous_index)
+                && !explicit_focus_input(ui)
+            {
                 // A live sort can move the focused process outside the instantiated
-                // rows. Follow that identity so it does not lose keyboard focus.
-                focus_target = Some(key);
+                // rows. Follow its identity, or the nearest surviving row if it
+                // exited or left the filter. Focus recovery preserves selection.
+                focus_target = Some(ProcessKey::from(processes[index]));
                 scroll_target = Some(index);
             }
         }
@@ -708,6 +723,23 @@ fn navigation_target(current: usize, length: usize, page_rows: usize, key: egui:
         egui::Key::End => last,
         _ => current.min(last),
     }
+}
+
+fn explicit_focus_input(ui: &Ui) -> bool {
+    // Let native hit testing and accessibility actions choose their target before
+    // recovery can move the viewport or override the user's requested focus.
+    ui.input(|input| {
+        input.pointer.any_down()
+            || input.pointer.any_pressed()
+            || input.pointer.any_released()
+            || input.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::AccessKitActionRequest(request)
+                        if matches!(request.action, egui::accesskit::Action::Focus | egui::accesskit::Action::Click)
+                )
+            })
+    })
 }
 
 fn selected_process(snapshot: &ProcessSnapshot, key: ProcessKey) -> Option<&Process> {
@@ -1081,6 +1113,411 @@ mod tests {
         assert_eq!(navigation_target(5, 1000, 12, egui::Key::PageUp), 0);
         assert_eq!(navigation_target(5, 1000, 12, egui::Key::End), 999);
         assert_eq!(navigation_target(999, 1000, 12, egui::Key::Home), 0);
+    }
+
+    fn process_frame(
+        ctx: &egui::Context,
+        view: &mut ProcessView,
+        snapshot: &ProcessSnapshot,
+        events: Vec<egui::Event>,
+    ) {
+        let output = ctx.run_ui(
+            egui::RawInput {
+                events,
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1600.0, 1200.0),
+                )),
+                ..Default::default()
+            },
+            |ui| view.show(ui, snapshot),
+        );
+        output.drop_without_applying_deltas();
+    }
+
+    fn process_key(
+        ctx: &egui::Context,
+        view: &mut ProcessView,
+        snapshot: &ProcessSnapshot,
+        key: Option<egui::Key>,
+    ) {
+        process_frame(
+            ctx,
+            view,
+            snapshot,
+            key.into_iter()
+                .map(|key| egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                })
+                .collect(),
+        );
+        for _ in 0..4 {
+            process_frame(ctx, view, snapshot, vec![]);
+        }
+    }
+
+    fn focus_first_process(
+        ctx: &egui::Context,
+        view: &mut ProcessView,
+        snapshot: &ProcessSnapshot,
+    ) -> egui::Id {
+        crate::theme::apply(ctx);
+        ctx.all_styles_mut(|style| {
+            style.scroll_animation = egui::style::ScrollAnimation::none();
+        });
+        process_key(ctx, view, snapshot, None);
+        process_key(ctx, view, snapshot, Some(egui::Key::Tab));
+        let search_id = ctx.memory(|memory| memory.focused()).unwrap();
+        for _ in 0..20 {
+            if view.focused.is_some() {
+                return search_id;
+            }
+            process_key(ctx, view, snapshot, Some(egui::Key::Tab));
+        }
+        panic!("Tab did not reach the process table");
+    }
+
+    #[test]
+    fn keyboard_focus_recovers_when_a_process_exits_or_leaves_the_state_filter() {
+        for filtered in [false, true] {
+            for index in [0, 5, 99] {
+                let ctx = egui::Context::default();
+                let mut view = ProcessView {
+                    state: if filtered {
+                        StateFilter::Sleeping
+                    } else {
+                        StateFilter::All
+                    },
+                    ..Default::default()
+                };
+                let mut snapshot = ProcessSnapshot {
+                    processes: (1..=100).map(|pid| process(pid, Some(0.0))).collect(),
+                    ..Default::default()
+                };
+                focus_first_process(&ctx, &mut view, &snapshot);
+                if index == 99 {
+                    process_key(&ctx, &mut view, &snapshot, Some(egui::Key::End));
+                } else {
+                    for _ in 0..index {
+                        process_key(&ctx, &mut view, &snapshot, Some(egui::Key::ArrowDown));
+                    }
+                }
+                process_key(&ctx, &mut view, &snapshot, Some(egui::Key::Enter));
+                let departed = view.selected.unwrap();
+                if filtered {
+                    snapshot.processes[index].state = 'R';
+                } else {
+                    snapshot.processes.remove(index);
+                }
+                process_key(&ctx, &mut view, &snapshot, None);
+                let rows = filtered_processes(&snapshot, "", view.state);
+                let replacement_index = index.min(rows.len() - 1);
+                let replacement = ProcessKey::from(rows[replacement_index]);
+                let (focused, id, actual_index) = view.focused.unwrap();
+                assert_eq!(ctx.memory(|memory| memory.focused()), Some(id));
+                assert_eq!(focused, replacement);
+                assert_eq!(actual_index, replacement_index);
+                // Moving focus must not silently replace the inspected process.
+                assert_eq!(view.selected, Some(departed));
+                assert_eq!(selected_process(&snapshot, departed).is_some(), filtered);
+
+                let (key, next_index) = if replacement_index == rows.len() - 1 {
+                    (egui::Key::ArrowUp, replacement_index - 1)
+                } else {
+                    (egui::Key::ArrowDown, replacement_index + 1)
+                };
+                let next = ProcessKey::from(rows[next_index]);
+                process_key(&ctx, &mut view, &snapshot, Some(key));
+                assert_eq!(view.selected, Some(next));
+                assert_eq!(view.focused.unwrap().0, next);
+                assert!(ctx.memory(|memory| memory.has_focus(view.focused.unwrap().1)));
+
+                // A refresh can also arrive in the very frame of an arrow key.
+                if filtered {
+                    snapshot
+                        .processes
+                        .iter_mut()
+                        .find(|process| ProcessKey::from(&**process) == next)
+                        .unwrap()
+                        .state = 'R';
+                } else {
+                    snapshot
+                        .processes
+                        .retain(|process| ProcessKey::from(process) != next);
+                }
+                process_key(&ctx, &mut view, &snapshot, Some(egui::Key::ArrowDown));
+                let selected = view.selected.unwrap();
+                assert_ne!(selected, next);
+                assert!(
+                    filtered_processes(&snapshot, "", view.state)
+                        .iter()
+                        .any(|process| ProcessKey::from(*process) == selected)
+                );
+                assert_eq!(view.focused.unwrap().0, selected);
+                assert!(ctx.memory(|memory| memory.has_focus(view.focused.unwrap().1)));
+            }
+        }
+    }
+
+    #[test]
+    fn recovered_focus_preserves_pid_identity_and_does_not_pull_back_manual_scrolls() {
+        let ctx = egui::Context::default();
+        let mut view = ProcessView::default();
+        let mut snapshot = ProcessSnapshot {
+            processes: (1..=100).map(|pid| process(pid, Some(0.0))).collect(),
+            ..Default::default()
+        };
+        let search_id = focus_first_process(&ctx, &mut view, &snapshot);
+        for _ in 0..5 {
+            process_key(&ctx, &mut view, &snapshot, Some(egui::Key::ArrowDown));
+        }
+        let departed = view.selected.unwrap();
+        snapshot.processes[5].start_time_ticks += 1;
+        process_key(&ctx, &mut view, &snapshot, None);
+        let replacement = ProcessKey::from(&snapshot.processes[5]);
+        assert_eq!(view.focused.unwrap().0, replacement);
+        assert!(ctx.memory(|memory| memory.has_focus(view.focused.unwrap().1)));
+        assert_eq!(view.selected, Some(departed));
+        assert!(selected_process(&snapshot, departed).is_none());
+
+        let response = ctx.read_response(view.focused.unwrap().1).unwrap();
+        process_frame(
+            &ctx,
+            &mut view,
+            &snapshot,
+            vec![
+                egui::Event::PointerMoved(response.interact_rect.center()),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -100.0),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        for _ in 0..20 {
+            process_frame(&ctx, &mut view, &snapshot, vec![]);
+        }
+        assert!(ctx.read_response(response.id).unwrap().rect.top() < response.rect.top() - 50.0);
+
+        // A stale row identity must not reclaim focus from another control.
+        ctx.memory_mut(|memory| memory.request_focus(search_id));
+        snapshot.processes.remove(5);
+        process_key(&ctx, &mut view, &snapshot, None);
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(search_id));
+        assert_eq!(view.selected, Some(departed));
+    }
+
+    fn click_process_response(response: &egui::Response) -> Vec<egui::Event> {
+        let pos = response.interact_rect.center();
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    }
+
+    #[test]
+    fn explicit_row_interactions_win_over_recovery_in_either_render_order_and_viewport() {
+        for (clicked_pid, departed_pid, scroll) in [(2, 5, false), (8, 5, false), (42, 53, true)] {
+            for action in [
+                None,
+                Some(egui::accesskit::Action::Focus),
+                Some(egui::accesskit::Action::Click),
+            ] {
+                let ctx = egui::Context::default();
+                ctx.enable_accesskit();
+                let mut view = ProcessView::default();
+                let mut snapshot = ProcessSnapshot {
+                    processes: (1..=100).map(|pid| process(pid, Some(0.0))).collect(),
+                    ..Default::default()
+                };
+                focus_first_process(&ctx, &mut view, &snapshot);
+                for _ in 1..clicked_pid {
+                    process_key(&ctx, &mut view, &snapshot, Some(egui::Key::ArrowDown));
+                }
+                let (clicked_key, clicked_id, _) = view.focused.unwrap();
+                let key = if clicked_pid < departed_pid {
+                    egui::Key::ArrowDown
+                } else {
+                    egui::Key::ArrowUp
+                };
+                for _ in clicked_pid.min(departed_pid)..clicked_pid.max(departed_pid) {
+                    process_key(&ctx, &mut view, &snapshot, Some(key));
+                }
+                if scroll {
+                    // Place the target near the viewport's top edge: automatic
+                    // recentering would virtualize it away before handling its click.
+                    let response = ctx.read_response(view.focused.unwrap().1).unwrap();
+                    process_frame(
+                        &ctx,
+                        &mut view,
+                        &snapshot,
+                        vec![
+                            egui::Event::PointerMoved(response.interact_rect.center()),
+                            egui::Event::MouseWheel {
+                                unit: egui::MouseWheelUnit::Point,
+                                delta: egui::vec2(0.0, 170.0),
+                                phase: egui::TouchPhase::Move,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                    );
+                    for _ in 0..20 {
+                        process_frame(&ctx, &mut view, &snapshot, vec![]);
+                    }
+                }
+                assert!(ctx.memory(|memory| memory.has_focus(view.focused.unwrap().1)));
+                let response = ctx.read_response(clicked_id).unwrap();
+                assert!(response.interact_rect.height() > 20.0);
+                let events = action.map_or_else(
+                    || click_process_response(&response),
+                    |action| {
+                        vec![egui::Event::AccessKitActionRequest(
+                            egui::accesskit::ActionRequest {
+                                action,
+                                target_tree: egui::accesskit::TreeId::ROOT,
+                                target_node: clicked_id.accesskit_id(),
+                                data: None,
+                            },
+                        )]
+                    },
+                );
+                snapshot
+                    .processes
+                    .retain(|process| process.pid != departed_pid);
+                process_frame(&ctx, &mut view, &snapshot, events);
+                assert_eq!(ctx.memory(|memory| memory.focused()), Some(clicked_id));
+                assert_eq!(view.focused.unwrap().0, clicked_key);
+                if action != Some(egui::accesskit::Action::Focus) {
+                    assert_eq!(view.selected, Some(clicked_key));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_process_list_returns_row_focus_to_search_without_changing_selection() {
+        for filtered in [false, true] {
+            let ctx = egui::Context::default();
+            let mut view = ProcessView {
+                state: if filtered {
+                    StateFilter::Sleeping
+                } else {
+                    StateFilter::All
+                },
+                ..Default::default()
+            };
+            let mut snapshot = ProcessSnapshot {
+                processes: vec![process(1, Some(0.0))],
+                ..Default::default()
+            };
+            let search_id = focus_first_process(&ctx, &mut view, &snapshot);
+            process_key(&ctx, &mut view, &snapshot, Some(egui::Key::Enter));
+            let selected = view.selected;
+            if filtered {
+                snapshot.processes[0].state = 'R';
+            } else {
+                snapshot.processes.clear();
+            }
+            process_key(&ctx, &mut view, &snapshot, None);
+            assert_eq!(ctx.memory(|memory| memory.focused()), Some(search_id));
+            assert_eq!(view.selected, selected);
+            snapshot.processes = vec![process(2, Some(0.0))];
+            process_key(&ctx, &mut view, &snapshot, None);
+            assert_eq!(ctx.memory(|memory| memory.focused()), Some(search_id));
+        }
+    }
+
+    #[test]
+    fn an_empty_process_list_reveals_search_in_a_compact_scrolled_page() {
+        let mut had_offscreen_search = false;
+        for size in [egui::vec2(320.0, 240.0), egui::vec2(640.0, 480.0)] {
+            let ctx = egui::Context::default();
+            crate::theme::apply(&ctx);
+            ctx.all_styles_mut(|style| {
+                style.scroll_animation = egui::style::ScrollAnimation::none();
+            });
+            let mut view = ProcessView::default();
+            let mut snapshot = ProcessSnapshot {
+                processes: vec![process(1, Some(0.0))],
+                ..Default::default()
+            };
+            let frame = |view: &mut ProcessView, snapshot: &ProcessSnapshot, tab: bool| {
+                let output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                        events: if tab {
+                            vec![egui::Event::Key {
+                                key: egui::Key::Tab,
+                                physical_key: None,
+                                pressed: true,
+                                repeat: false,
+                                modifiers: egui::Modifiers::NONE,
+                            }]
+                        } else {
+                            vec![]
+                        },
+                        ..Default::default()
+                    },
+                    |ui| {
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            ui.add_space(150.0);
+                            view.show(ui, snapshot);
+                        });
+                    },
+                );
+                output.drop_without_applying_deltas();
+            };
+            for _ in 0..4 {
+                frame(&mut view, &snapshot, false);
+            }
+            frame(&mut view, &snapshot, true);
+            let search_id = ctx.memory(|memory| memory.focused()).unwrap();
+            for _ in 0..20 {
+                if view.focused.is_some() {
+                    break;
+                }
+                frame(&mut view, &snapshot, true);
+                for _ in 0..4 {
+                    frame(&mut view, &snapshot, false);
+                }
+            }
+            assert!(ctx.memory(|memory| memory.has_focus(view.focused.unwrap().1)));
+            let search = ctx.read_response(search_id).unwrap();
+            had_offscreen_search |= !search.interact_rect.contains_rect(search.rect);
+
+            snapshot.processes.clear();
+            for _ in 0..5 {
+                frame(&mut view, &snapshot, false);
+            }
+            let search = ctx.read_response(search_id).unwrap();
+            assert!(search.has_focus());
+            assert!(
+                search.interact_rect.contains_rect(search.rect),
+                "{size:?}: focused search {:?} is outside its visible area {:?}",
+                search.rect,
+                search.interact_rect,
+            );
+        }
+        assert!(
+            had_offscreen_search,
+            "the test must exercise clipped Search"
+        );
     }
 
     #[test]

@@ -128,6 +128,8 @@ Disk generations from `/sys/block/<device>/diskseq` distinguish replacement driv
 
 Network counters come from `/proc/net/dev`; loopback is excluded. Interface indices identify replacement links even when they reuse a previous name; a replacement starts with a fresh rate baseline. If an interface's identity cannot be read, its lifetime counters remain visible while rates are unavailable. “All interfaces” sums interface traffic, including virtual interfaces. A bridge, VPN, or virtual adapter can observe traffic also counted on another interface, so that sum is not necessarily unique external traffic. Select a specific interface when you need its rate. “Up” primarily reflects the interface's administrative `IFF_UP` flag and does not guarantee Internet connectivity. If that flag cannot be read, a definite operational up/down state is used as a fallback. Missing, invalid, or indeterminate status displays “Unavailable” with a notice; valid traffic counters continue updating.
 
+Unusual interface names display invalid UTF-8 bytes, control characters, and literal backslashes with escapes. Each interface keeps its own counters and history, including names that would otherwise look identical after text conversion.
+
 A selected disk or network interface stays selected across pause/resume and missing readings. Its selector shows “unavailable” until it returns; choose “All devices” or “All interfaces” to switch back to combined traffic.
 
 ### Temperatures and unavailable data
@@ -153,6 +155,8 @@ Process CPU usage follows top's usual convention: **100% is one logical core**, 
 RES is resident memory; VIRT is virtual address space; SHR is shared resident memory reported by `statm`. Memory percentage is RES divided by system physical RAM. These kernel accounting values are approximate; summing RES across processes can double-count shared pages. Units use binary multiples. User names resolve from local account records, with a numeric effective UID fallback.
 
 Processes that exit while being sampled are omitted. Linux permissions, `hidepid`, containers, or namespaces may limit the visible list or particular fields; unavailable values are marked instead of fabricated. Selecting a process retains its PID and start-time identity so a reused PID cannot silently replace it in the details view. Command lines come from `cmdline` and are capped at 64 KiB with an ellipsis; kernel threads fall back to their bracketed names. The monitor reads no process environment variables and does not send signals or change process priority.
+
+If the focused process exits or stops matching the active filter, keyboard focus moves to a nearby surviving row. If no rows remain, focus returns to Search. The selected details keep their original process identity until you select another process.
 
 See the Linux kernel's [process information documentation](https://docs.kernel.org/filesystems/proc.html#process-specific-subdirectories).
 

@@ -5,7 +5,9 @@
 //! https://docs.kernel.org/hwmon/sysfs-interface.html.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -109,6 +111,7 @@ pub struct Disk {
 
 #[derive(Clone, Debug, Default)]
 pub struct Network {
+    /// Unique display name; backslashes, controls, and invalid UTF-8 are escaped.
     pub name: String,
     pub received_bytes_per_sec: Option<f64>,
     pub transmitted_bytes_per_sec: Option<f64>,
@@ -168,7 +171,7 @@ pub struct Collector {
     sys_root: PathBuf,
     previous_cpu: BTreeMap<String, CpuTimes>,
     previous_disks: BTreeMap<String, DiskBaseline>,
-    previous_networks: BTreeMap<String, NetworkBaseline>,
+    previous_networks: BTreeMap<OsString, NetworkBaseline>,
     previous_disk_time: Option<Instant>,
     previous_network_time: Option<Instant>,
     hostname: String,
@@ -404,21 +407,24 @@ impl Collector {
             .into_iter()
             .flatten()
             .flatten()
-            .filter_map(|entry| {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                Some((name, network_ifindex(&entry.path())?))
-            })
+            .filter_map(|entry| Some((entry.file_name(), network_ifindex(&entry.path())?)))
             .collect();
-        let Some(text) = read_required(&self.proc_root.join("net/dev"), warnings) else {
-            self.previous_networks.clear();
-            self.previous_network_time = None;
-            return Vec::new();
+        // Interface names are Linux byte strings, not necessarily UTF-8.
+        let path = self.proc_root.join("net/dev");
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                warnings.push(format!("Cannot read {}: {error}", path.display()));
+                self.previous_networks.clear();
+                self.previous_network_time = None;
+                return Vec::new();
+            }
         };
         let now = Instant::now();
         let elapsed = self
             .previous_network_time
             .map(|previous| now.duration_since(previous).as_secs_f64());
-        let counters = parse_networks(&text);
+        let counters = parse_networks(&bytes);
         let mut next_baselines = BTreeMap::new();
         let mut unknown_identities = 0;
         let mut unknown_states = 0;
@@ -460,7 +466,7 @@ impl Collector {
                     unknown_states += 1;
                 }
                 Network {
-                    name: name.clone(),
+                    name: display_interface_name(name),
                     received_bytes_per_sec: previous
                         .and_then(|previous| counter_rate(previous.first, current.first, elapsed)),
                     transmitted_bytes_per_sec: previous.and_then(|previous| {
@@ -738,20 +744,24 @@ fn leaf_block_devices(sys_root: &Path, warnings: &mut Vec<String>) -> Option<BTr
     Some(devices)
 }
 
-fn parse_networks(text: &str) -> BTreeMap<String, Counters> {
-    text.lines()
+fn parse_networks(bytes: &[u8]) -> BTreeMap<OsString, Counters> {
+    bytes
+        .split(|byte| *byte == b'\n')
         .filter_map(|line| {
-            let (name, values) = line.rsplit_once(':')?;
-            let name = name.trim();
-            if name.is_empty() || name == "lo" {
+            let separator = line.iter().rposition(|byte| *byte == b':')?;
+            // Only ASCII whitespace is procfs padding. Unicode whitespace can
+            // be part of a legal name and must survive the sysfs lookup.
+            let name = line[..separator].trim_ascii();
+            if name.is_empty() || name == b"lo" {
                 return None;
             }
-            let fields: Vec<&str> = values.split_whitespace().collect();
+            let values = std::str::from_utf8(&line[separator + 1..]).ok()?;
+            let fields: Vec<&str> = values.split_ascii_whitespace().collect();
             if fields.len() < 16 {
                 return None;
             }
             Some((
-                name.to_owned(),
+                OsString::from_vec(name.to_vec()),
                 Counters {
                     first: fields[0].parse().ok()?,
                     second: fields[8].parse().ok()?,
@@ -759,6 +769,25 @@ fn parse_networks(text: &str) -> BTreeMap<String, Counters> {
             ))
         })
         .collect()
+}
+
+fn display_interface_name(name: &OsStr) -> String {
+    // The UI uses this name for selection and history lookup, so escaped byte
+    // names must also remain distinct from names containing literal backslashes.
+    let mut display = String::new();
+    for chunk in name.as_bytes().utf8_chunks() {
+        for character in chunk.valid().chars() {
+            if character == '\\' || character.is_control() {
+                display.extend(character.escape_debug());
+            } else {
+                display.push(character);
+            }
+        }
+        for byte in chunk.invalid() {
+            display.push_str(&format!("\\x{byte:02x}"));
+        }
+    }
+    display
 }
 
 fn counter_rate(previous: u64, current: u64, elapsed: Option<f64>) -> Option<f64> {
@@ -1146,11 +1175,11 @@ mod tests {
     #[test]
     fn network_parser_separates_receive_transmit_and_omits_loopback() {
         let counters = parse_networks(
-            "Inter-| Receive | Transmit\n lo: 99 1 0 0 0 0 0 0 99 1 0 0 0 0 0 0\n eth0: 1024 2 0 0 0 0 0 0 2048 4 0 0 0 0 0 0\n bad: 1 2",
+            b"Inter-| Receive | Transmit\n lo: 99 1 0 0 0 0 0 0 99 1 0 0 0 0 0 0\n eth0: 1024 2 0 0 0 0 0 0 2048 4 0 0 0 0 0 0\n bad: 1 2",
         );
         assert_eq!(counters.len(), 1);
-        assert_eq!(counters["eth0"].first, 1024);
-        assert_eq!(counters["eth0"].second, 2048);
+        assert_eq!(counters[OsStr::new("eth0")].first, 1024);
+        assert_eq!(counters[OsStr::new("eth0")].second, 2048);
     }
 
     #[test]
@@ -1460,6 +1489,126 @@ mod tests {
             Some(0.0)
         );
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn non_utf8_interface_names_preserve_all_counters_and_rate_baselines() {
+        let fixture = Fixture::new();
+        let names: &[(&[u8], &str)] = &[
+            (b"eth0", "eth0"),
+            (b"eth\xff", r"eth\xff"),
+            (b"eth\xfe", r"eth\xfe"),
+            ("eth\u{fffd}".as_bytes(), "eth\u{fffd}"),
+            (br"eth\xff", r"eth\\xff"),
+            ("\u{a0}eth\u{a0}".as_bytes(), "\u{a0}eth\u{a0}"),
+            ("eth\u{85}".as_bytes(), r"eth\u{85}"),
+            (b"eth\x85", r"eth\x85"),
+        ];
+        let net_root = fixture.0.join("sys/class/net");
+        for (index, (raw, _)) in names.iter().enumerate() {
+            let directory = net_root.join(OsStr::from_bytes(raw));
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join("ifindex"), (index + 2).to_string()).unwrap();
+            fs::write(
+                directory.join("flags"),
+                if index % 2 == 0 { "0x1" } else { "0x0" },
+            )
+            .unwrap();
+        }
+        let write_counters = |count: usize| {
+            let mut bytes = Vec::new();
+            for (index, (raw, _)) in names.iter().take(count).enumerate() {
+                bytes.extend_from_slice(raw);
+                bytes.extend_from_slice(
+                    format!(
+                        ": {} 0 0 0 0 0 0 0 {} 0 0 0 0 0 0 0\n",
+                        100 + index,
+                        200 + index
+                    )
+                    .as_bytes(),
+                );
+            }
+            fs::write(fixture.0.join("proc/net/dev"), bytes).unwrap();
+        };
+        fixture.write("proc/net/dev", "");
+        write_counters(1);
+        let mut collector = Collector::with_roots(fixture.0.join("proc"), fixture.0.join("sys"));
+        let mut warnings = Vec::new();
+        collector.sample_networks(&mut warnings);
+        assert_eq!(
+            collector.sample_networks(&mut warnings)[0].received_bytes_per_sec,
+            Some(0.0)
+        );
+
+        write_counters(names.len());
+        let added = collector.sample_networks(&mut warnings);
+        assert_eq!(added.len(), names.len());
+        let displayed_names: BTreeSet<_> = added.iter().map(|network| &network.name).collect();
+        assert_eq!(
+            displayed_names.len(),
+            names.len(),
+            "display names must not merge selections"
+        );
+        for (index, (_, display)) in names.iter().enumerate() {
+            let network = added
+                .iter()
+                .find(|network| network.name == *display)
+                .unwrap();
+            assert_eq!(network.total_received_bytes, 100 + index as u64);
+            assert_eq!(network.total_transmitted_bytes, 200 + index as u64);
+            assert_eq!(network.is_up, Some(index % 2 == 0));
+            assert_eq!(network.received_bytes_per_sec, (index == 0).then_some(0.0));
+        }
+        let steady = collector.sample_networks(&mut warnings);
+        assert!(
+            steady
+                .iter()
+                .all(|network| network.received_bytes_per_sec == Some(0.0)
+                    && network.transmitted_bytes_per_sec == Some(0.0))
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        // Replacing only the raw-byte name must not disturb any other baseline.
+        fs::write(
+            net_root.join(OsStr::from_bytes(b"eth\xff")).join("ifindex"),
+            "99",
+        )
+        .unwrap();
+        let replaced = collector.sample_networks(&mut warnings);
+        for network in replaced {
+            let expected = (network.name != r"eth\xff").then_some(0.0);
+            assert_eq!(network.received_bytes_per_sec, expected);
+            assert_eq!(network.transmitted_bytes_per_sec, expected);
+        }
+        assert!(
+            collector
+                .sample_networks(&mut warnings)
+                .iter()
+                .all(|network| network.received_bytes_per_sec == Some(0.0))
+        );
+
+        write_counters(1);
+        let removed = collector.sample_networks(&mut warnings);
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].name, "eth0");
+        assert_eq!(removed[0].received_bytes_per_sec, Some(0.0));
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        // A genuine I/O failure still clears baselines and reports availability.
+        fs::remove_file(fixture.0.join("proc/net/dev")).unwrap();
+        assert!(collector.sample_networks(&mut warnings).is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("Cannot read"));
+        warnings.clear();
+        write_counters(names.len());
+        let recovered = collector.sample_networks(&mut warnings);
+        assert_eq!(recovered.len(), names.len());
+        assert!(
+            recovered
+                .iter()
+                .all(|network| network.received_bytes_per_sec.is_none())
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     #[test]
