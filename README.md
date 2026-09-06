@@ -2,6 +2,8 @@
 
 A native Linux system monitor written in Rust, with a [Catppuccin Mocha](https://catppuccin.com/palette/) interface. Live values and one-minute line charts show system activity at a glance.
 
+![Loadpeek Summary dashboard in Catppuccin Mocha showing CPU, memory, disk, network, thermals, and system load.](docs/images/summary.png)
+
 ## Build and run
 
 Use **Rust 1.95 or newer** with Cargo, a C compiler/linker, and a Linux desktop session. The GUI uses egui/eframe with the Glow OpenGL renderer and both X11 and Wayland support.
