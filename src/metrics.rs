@@ -768,8 +768,14 @@ fn counter_rate(previous: u64, current: u64, elapsed: Option<f64>) -> Option<f64
     rate.is_finite().then_some(rate)
 }
 
-fn cpu_sensor_name(name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
+fn cpu_sensor_name(source: &str, label: &str) -> bool {
+    let source = source.to_ascii_lowercase();
+    // PECI DIMM drivers include the owning CPU socket in their name, but
+    // measure memory. A channel label must not override that known identity.
+    if source == "peci_dimmtemp" || source.starts_with("peci_dimmtemp.") {
+        return false;
+    }
+    let label = label.to_ascii_lowercase();
     [
         "coretemp",
         "k10temp",
@@ -782,7 +788,7 @@ fn cpu_sensor_name(name: &str) -> bool {
         "tdie",
     ]
     .iter()
-    .any(|part| name.contains(part))
+    .any(|part| source.contains(part) || label.contains(part))
 }
 
 fn read_temperature(path: &Path) -> Option<f64> {
@@ -809,6 +815,14 @@ fn discover_sensors(sys_root: &Path, warnings: &mut Vec<String>) -> Vec<Sensor> 
                 .to_string_lossy()
                 .into_owned();
             let is_peci_cpu = driver == "peci_cputemp" || driver.starts_with("peci_cputemp.");
+            // Chip names from the kernel's it87_devices table. This driver
+            // defines _type=0 as unused; the generic hwmon ABI does not.
+            let is_it87 = [
+                "it87", "it8712", "it8716", "it8718", "it8720", "it8721", "it8728", "it8732",
+                "it8771", "it8772", "it8781", "it8782", "it8783", "it8786", "it8790", "it8792",
+                "it8603", "it8620", "it8622", "it8628", "it8689", "it87952",
+            ]
+            .contains(&driver.as_str());
             // Some older drivers expose attributes under hwmonN/device.
             for directory in [root.clone(), root.join("device")] {
                 let Ok(attributes) = fs::read_dir(&directory) else {
@@ -836,6 +850,9 @@ fn discover_sensors(sys_root: &Path, warnings: &mut Vec<String>) -> Vec<Sensor> 
                     }
                     if read_trimmed(directory.join(format!("{channel}_enable"))).as_deref()
                         == Some("0")
+                        || (is_it87
+                            && read_trimmed(directory.join(format!("{channel}_type"))).as_deref()
+                                == Some("0"))
                     {
                         rejected_sources.insert(canonical);
                         continue;
@@ -888,13 +905,14 @@ fn discover_sensors(sys_root: &Path, warnings: &mut Vec<String>) -> Vec<Sensor> 
                         },
                         _ => CpuTemperatureSource::Other,
                     };
+                    let is_cpu = cpu_sensor_name(&driver, &label);
                     let label = format!("{driver} · {label}");
                     let critical_celsius =
                         read_temperature(&directory.join(format!("{channel}_crit")))
                             .filter(|value| *value > 0.0);
                     sensors.push(Sensor {
                         id: canonical.to_string_lossy().into_owned(),
-                        is_cpu: cpu_sensor_name(&label),
+                        is_cpu,
                         label,
                         celsius,
                         critical_celsius,
@@ -950,7 +968,7 @@ fn discover_sensors(sys_root: &Path, warnings: &mut Vec<String>) -> Vec<Sensor> 
                 .min_by(f64::total_cmp);
             sensors.push(Sensor {
                 id: canonical.to_string_lossy().into_owned(),
-                is_cpu: cpu_sensor_name(&label),
+                is_cpu: cpu_sensor_name(&label, ""),
                 label,
                 celsius,
                 critical_celsius,
@@ -2057,5 +2075,158 @@ mod tests {
         assert_eq!(die.celsius, 40.0);
         assert_eq!(die.critical_celsius, Some(100.0));
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn peci_dimm_readings_never_supply_the_cpu_headline() {
+        for directory in ["class/hwmon/hwmon0", "class/hwmon/hwmon0/device"] {
+            for driver in ["peci_dimmtemp", "peci_dimmtemp.cpu0", "peci_dimmtemp.cpu12"] {
+                let fixture = Fixture::new();
+                fixture.write(&format!("{directory}/name"), driver);
+                fixture.write(&format!("{directory}/temp1_label"), "DIMM A1");
+                fixture.write(&format!("{directory}/temp1_input"), "80000");
+                fixture.write(&format!("{directory}/temp1_crit"), "95000");
+                let sample = || Snapshot {
+                    sensors: discover_sensors(&fixture.0, &mut Vec::new()),
+                    ..Snapshot::default()
+                };
+
+                let dimm_only = sample();
+                assert_eq!(dimm_only.sensors.len(), 1, "{driver} at {directory}");
+                assert!(!dimm_only.sensors[0].is_cpu, "{driver} at {directory}");
+                assert_eq!(dimm_only.cpu_temperature(), None);
+                assert_eq!(dimm_only.sensors[0].celsius, 80.0);
+                assert_eq!(dimm_only.sensors[0].critical_celsius, Some(95.0));
+                assert_eq!(dimm_only.sensors[0].label, format!("{driver} · DIMM A1"));
+
+                // The source remains memory even with a CPU-labelled channel,
+                // or when the optional channel label is unavailable.
+                fixture.write(&format!("{directory}/temp1_label"), "CPU socket 0 DIMM A1");
+                assert_eq!(sample().cpu_temperature(), None);
+                fs::remove_file(fixture.0.join(format!("{directory}/temp1_label"))).unwrap();
+                assert_eq!(sample().cpu_temperature(), None);
+
+                fixture.write("class/hwmon/hwmon1/name", "peci_cputemp.cpu0");
+                fixture.write("class/hwmon/hwmon1/temp1_label", "Die");
+                fixture.write("class/hwmon/hwmon1/temp1_input", "40000");
+                let mixed = sample();
+                assert_eq!(mixed.sensors.len(), 2);
+                assert_eq!(mixed.cpu_temperature(), Some(40.0));
+                assert_eq!(
+                    mixed.sensors.iter().filter(|sensor| sensor.is_cpu).count(),
+                    1
+                );
+            }
+        }
+        for source in ["peci_dimmtemp", "peci_dimmtemp.cpu0"] {
+            let fixture = Fixture::new();
+            fixture.write("class/thermal/thermal_zone0/type", source);
+            fixture.write("class/thermal/thermal_zone0/temp", "80000");
+            let snapshot = Snapshot {
+                sensors: discover_sensors(&fixture.0, &mut Vec::new()),
+                ..Snapshot::default()
+            };
+            assert_eq!(snapshot.sensors.len(), 1);
+            assert_eq!(snapshot.sensors[0].celsius, 80.0);
+            assert!(!snapshot.sensors[0].is_cpu);
+            assert_eq!(snapshot.cpu_temperature(), None);
+        }
+    }
+
+    #[test]
+    fn cpu_sensor_driver_and_channel_recognition_is_retained() {
+        for (driver, label) in [
+            ("coretemp", "Package id 0"),
+            ("k10temp", "Tdie"),
+            ("k8temp", "temp1"),
+            ("zenpower", "Tctl"),
+            ("peci_cputemp", "Die"),
+            ("peci_cputemp.cpu12", "Die"),
+            ("board_sensor", "CPU"),
+        ] {
+            let fixture = Fixture::new();
+            fixture.write("class/hwmon/hwmon0/name", driver);
+            fixture.write("class/hwmon/hwmon0/temp1_label", label);
+            fixture.write("class/hwmon/hwmon0/temp1_input", "42000");
+            let snapshot = Snapshot {
+                sensors: discover_sensors(&fixture.0, &mut Vec::new()),
+                ..Snapshot::default()
+            };
+            assert_eq!(snapshot.cpu_temperature(), Some(42.0), "{driver}: {label}");
+        }
+        for zone_type in ["cpu-thermal", "x86_pkg_temp", "soc_thermal"] {
+            let fixture = Fixture::new();
+            fixture.write("class/thermal/thermal_zone0/type", zone_type);
+            fixture.write("class/thermal/thermal_zone0/temp", "43000");
+            let snapshot = Snapshot {
+                sensors: discover_sensors(&fixture.0, &mut Vec::new()),
+                ..Snapshot::default()
+            };
+            assert_eq!(snapshot.cpu_temperature(), Some(43.0), "{zone_type}");
+        }
+    }
+
+    #[test]
+    fn it87_disabled_sensor_types_are_omitted_and_reenable_recovers() {
+        for directory in ["class/hwmon/hwmon0", "class/hwmon/hwmon0/device"] {
+            for driver in ["it87", "it8728", "it8689", "it8603", "it87952"] {
+                let fixture = Fixture::new();
+                fixture.write(&format!("{directory}/name"), driver);
+                // A disabled input can remain readable and look plausible.
+                fixture.write(&format!("{directory}/temp1_input"), "127000");
+                let sample = || discover_sensors(&fixture.0, &mut Vec::new());
+
+                // The type attribute is optional; its absence is not disablement.
+                assert_eq!(sample().len(), 1, "{driver} at {directory}");
+                let type_path = fixture.0.join(format!("{directory}/temp1_type"));
+                fs::create_dir(&type_path).unwrap();
+                assert_eq!(sample().len(), 1, "unreadable type at {directory}");
+                fs::remove_dir(&type_path).unwrap();
+                fixture.write(&format!("{directory}/temp1_type"), "0");
+                assert!(sample().is_empty(), "{driver} at {directory}");
+                // Zero does not have a generic disablement meaning in hwmon.
+                fixture.write(&format!("{directory}/name"), "other");
+                assert_eq!(sample().len(), 1);
+                fixture.write(&format!("{directory}/name"), driver);
+                for enabled_type in ["3", "4"] {
+                    fixture.write(&format!("{directory}/temp1_type"), enabled_type);
+                    let sensors = sample();
+                    assert_eq!(sensors.len(), 1, "{driver} at {directory}");
+                    assert_eq!(sensors[0].celsius, 127.0);
+                }
+                fs::remove_file(fixture.0.join(format!("{directory}/temp1_type"))).unwrap();
+                assert_eq!(sample().len(), 1);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disabled_sensor_types_reject_canonical_aliases_even_when_read_later() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new();
+        fixture.write("class/hwmon/hwmon0/name", "it8728");
+        fixture.write("class/hwmon/hwmon0/temp1_input", "127000");
+        fixture.write("class/hwmon/hwmon0/device/temp1_type", "0");
+        let input = fixture.0.join("class/hwmon/hwmon0/temp1_input");
+        symlink(
+            &input,
+            fixture.0.join("class/hwmon/hwmon0/device/temp1_input"),
+        )
+        .unwrap();
+        fixture.write("class/thermal/thermal_zone0/type", "it8728");
+        symlink(&input, fixture.0.join("class/thermal/thermal_zone0/temp")).unwrap();
+        let sample = || discover_sensors(&fixture.0, &mut Vec::new());
+
+        // The modern view accepts the input before its legacy alias rejects it.
+        assert!(sample().is_empty());
+        fixture.write("class/hwmon/hwmon0/device/temp1_type", "4");
+        assert_eq!(sample().len(), 1);
+        // Rejection found in the first view must also survive later aliases.
+        fixture.write("class/hwmon/hwmon0/temp1_type", "0");
+        assert!(sample().is_empty());
+        fs::remove_file(fixture.0.join("class/hwmon/hwmon0/temp1_type")).unwrap();
+        assert_eq!(sample().len(), 1);
     }
 }
