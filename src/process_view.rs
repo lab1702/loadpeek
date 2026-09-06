@@ -83,7 +83,7 @@ impl Column {
             Self::Pid => 82.0,
             Self::User => 80.0,
             Self::Priority | Self::Nice => 42.0,
-            Self::Virtual | Self::Resident | Self::Shared => 82.0,
+            Self::Virtual | Self::Resident | Self::Shared => 94.0,
             Self::State => 46.0,
             Self::Cpu => 66.0,
             Self::Memory => 64.0,
@@ -1270,6 +1270,108 @@ mod tests {
             let manually_scrolled = ctx.read_response(response.id).unwrap();
             assert!(manually_scrolled.has_focus());
             assert!(manually_scrolled.rect.top() < response.rect.top() - 50.0);
+        }
+    }
+
+    #[test]
+    fn memory_cells_keep_numbers_and_units_intact_at_supported_sizes() {
+        let expected = [
+            "1023.0 KiB",
+            "1023.0 MiB",
+            "1023.0 GiB",
+            "1024.0 KiB",
+            "1024.0 MiB",
+            "1024.0 GiB",
+        ];
+        let processes: Vec<_> = [false, true]
+            .into_iter()
+            .enumerate()
+            .map(|(index, rounded_boundary)| {
+                let mut process = process(index as u32 + 1, Some(0.0));
+                let values = [1024_u64, 1024_u64.pow(2), 1024_u64.pow(3)].map(|unit| {
+                    Some(if rounded_boundary {
+                        1024 * unit - 1
+                    } else {
+                        1023 * unit
+                    })
+                });
+                [
+                    process.virtual_bytes,
+                    process.resident_bytes,
+                    process.shared_bytes,
+                ] = values;
+                process
+            })
+            .collect();
+        let rows: Vec<_> = processes.iter().collect();
+        for size in [
+            egui::vec2(320.0, 240.0),
+            egui::vec2(640.0, 480.0),
+            egui::vec2(1440.0, 1000.0),
+        ] {
+            let ctx = egui::Context::default();
+            crate::theme::apply(&ctx);
+            ctx.all_styles_mut(|style| {
+                style.scroll_animation = egui::style::ScrollAnimation::none();
+            });
+            let mut view = ProcessView::default();
+            let mut seen = [false; 6];
+            for frame in 0..40 {
+                // Focusing successive headers reveals each column when the
+                // table is wider than the viewport, just as in the process page.
+                let events = if frame >= 4 && frame % 4 == 0 {
+                    vec![egui::Event::Key {
+                        key: egui::Key::Tab,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }]
+                } else {
+                    vec![]
+                };
+                let output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| view.table(ui, &rows, false),
+                );
+                for clipped in &output.shapes {
+                    let egui::Shape::Text(text) = &clipped.shape else {
+                        continue;
+                    };
+                    let Some(index) = expected
+                        .iter()
+                        .position(|value| *value == text.galley.job.text)
+                    else {
+                        continue;
+                    };
+                    let rect = text.galley.rect.translate(text.pos.to_vec2());
+                    if !clipped.clip_rect.contains_rect(rect) {
+                        continue;
+                    }
+                    assert!(
+                        !text.galley.elided,
+                        "{size:?}: {} is truncated",
+                        expected[index]
+                    );
+                    assert_eq!(text.galley.rows.len(), 1);
+                    let painted: String = text.galley.rows[0]
+                        .glyphs
+                        .iter()
+                        .map(|glyph| glyph.chr)
+                        .collect();
+                    assert_eq!(painted, expected[index], "{size:?}: memory text changed");
+                    seen[index] = true;
+                }
+                output.drop_without_applying_deltas();
+                if seen.iter().all(|visible| *visible) {
+                    break;
+                }
+            }
+            assert_eq!(seen, [true; 6], "{size:?}: memory cells were unreachable");
         }
     }
 

@@ -776,6 +776,11 @@ fn cpu_sensor_name(source: &str, label: &str) -> bool {
         return false;
     }
     let label = label.to_ascii_lowercase();
+    // CPU VRM channels measure voltage regulators, not the processor. Keep
+    // their readings in hardware details without promoting them to CPU sensors.
+    if source.contains("vrm") || label.contains("vrm") {
+        return false;
+    }
     [
         "coretemp",
         "k10temp",
@@ -2130,6 +2135,64 @@ mod tests {
             assert_eq!(snapshot.sensors[0].celsius, 80.0);
             assert!(!snapshot.sensors[0].is_cpu);
             assert_eq!(snapshot.cpu_temperature(), None);
+        }
+    }
+
+    #[test]
+    fn cpu_vrm_readings_remain_visible_without_supplying_the_cpu_headline() {
+        for directory in ["class/hwmon/hwmon0", "class/hwmon/hwmon0/device"] {
+            let fixture = Fixture::new();
+            fixture.write(&format!("{directory}/name"), "asus_wmi_sensors");
+            fixture.write(&format!("{directory}/temp1_label"), "CPU VRM Temperature");
+            fixture.write(&format!("{directory}/temp1_input"), "85000");
+            fixture.write(&format!("{directory}/temp1_crit"), "100000");
+            let sample = || {
+                let mut warnings = Vec::new();
+                let snapshot = Snapshot {
+                    sensors: discover_sensors(&fixture.0, &mut warnings),
+                    ..Snapshot::default()
+                };
+                assert!(warnings.is_empty(), "{warnings:?}");
+                snapshot
+            };
+
+            let vrm_only = sample();
+            assert_eq!(vrm_only.sensors.len(), 1);
+            let vrm = &vrm_only.sensors[0];
+            assert_eq!(vrm.label, "asus_wmi_sensors · CPU VRM Temperature");
+            assert_eq!(vrm.celsius, 85.0);
+            assert_eq!(vrm.critical_celsius, Some(100.0));
+            assert_eq!(vrm_only.cpu_temperature(), None, "{directory}");
+            assert!(!vrm.is_cpu);
+
+            fixture.write(&format!("{directory}/temp2_label"), "CPU Temperature");
+            fixture.write(&format!("{directory}/temp2_input"), "40000");
+            let mixed = sample();
+            assert_eq!(mixed.sensors.len(), 2);
+            assert_eq!(mixed.cpu_temperature(), Some(40.0), "{directory}");
+            assert_eq!(
+                mixed.sensors.iter().filter(|sensor| sensor.is_cpu).count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn cpu_vrm_source_names_do_not_supply_the_cpu_headline() {
+        for source in ["cpu_vrm", "CPU-VRM"] {
+            let fixture = Fixture::new();
+            fixture.write("class/hwmon/hwmon0/name", source);
+            fixture.write("class/hwmon/hwmon0/temp1_label", "CPU");
+            fixture.write("class/hwmon/hwmon0/temp1_input", "85000");
+            fixture.write("class/thermal/thermal_zone0/type", source);
+            fixture.write("class/thermal/thermal_zone0/temp", "86000");
+            let snapshot = Snapshot {
+                sensors: discover_sensors(&fixture.0, &mut Vec::new()),
+                ..Snapshot::default()
+            };
+            assert_eq!(snapshot.sensors.len(), 2);
+            assert_eq!(snapshot.cpu_temperature(), None, "{source}");
+            assert!(snapshot.sensors.iter().all(|sensor| !sensor.is_cpu));
         }
     }
 
