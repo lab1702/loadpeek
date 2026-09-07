@@ -153,6 +153,14 @@ struct Counters {
     second: u64,
 }
 
+impl Counters {
+    fn follows(self, previous: Self) -> bool {
+        // Either decrease can reveal a device-wide reset even when traffic in
+        // the other direction has already caught up with its previous total.
+        self.first >= previous.first && self.second >= previous.second
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct DiskBaseline {
     diskseq: u64,
@@ -361,6 +369,7 @@ impl Collector {
                     self.previous_disks
                         .get(name)
                         .filter(|previous| previous.diskseq == sequence)
+                        .filter(|previous| current.follows(previous.counters))
                         .map(|previous| &previous.counters)
                 });
                 if let Some(diskseq) = diskseq {
@@ -430,14 +439,30 @@ impl Collector {
         let mut unknown_states = 0;
         let networks = counters
             .iter()
-            .map(|(name, current)| {
+            .filter_map(|(name, current)| {
                 let interface = self.sys_root.join("class/net").join(name);
+                let flags = read_trimmed(interface.join("flags"))
+                    .and_then(|text| u32::from_str_radix(text.trim_start_matches("0x"), 16).ok());
+                // Names are mutable: prefer IFF_LOOPBACK, using the conventional
+                // name only when sysfs cannot tell us the interface type.
+                if flags
+                    .map(|flags| flags & libc::IFF_LOOPBACK as u32 != 0)
+                    .or_else(|| {
+                        read_trimmed(interface.join("type"))
+                            .and_then(|text| text.parse::<u32>().ok())
+                            .map(|kind| kind == u32::from(libc::ARPHRD_LOOPBACK))
+                    })
+                    .unwrap_or_else(|| name == OsStr::new("lo"))
+                {
+                    return None;
+                }
                 let ifindex = network_ifindex(&interface)
                     .filter(|index| identities_before.get(name) == Some(index));
                 let previous = ifindex.and_then(|index| {
                     self.previous_networks
                         .get(name)
                         .filter(|previous| previous.ifindex == index)
+                        .filter(|previous| current.follows(previous.counters))
                         .map(|previous| &previous.counters)
                 });
                 if let Some(ifindex) = ifindex {
@@ -452,20 +477,17 @@ impl Collector {
                     unknown_identities += 1;
                 }
                 // IFF_UP is administrative state; unlike operstate it also describes virtual links.
-                let is_up = read_trimmed(interface.join("flags"))
-                    .and_then(|text| u32::from_str_radix(text.trim_start_matches("0x"), 16).ok())
-                    .map(|flags| flags & 1 != 0)
-                    .or_else(
-                        || match read_trimmed(interface.join("operstate")).as_deref() {
-                            Some("up") => Some(true),
-                            Some("down" | "lowerlayerdown") => Some(false),
-                            _ => None,
-                        },
-                    );
+                let is_up = flags.map(|flags| flags & 1 != 0).or_else(|| {
+                    match read_trimmed(interface.join("operstate")).as_deref() {
+                        Some("up") => Some(true),
+                        Some("down" | "lowerlayerdown") => Some(false),
+                        _ => None,
+                    }
+                });
                 if is_up.is_none() {
                     unknown_states += 1;
                 }
-                Network {
+                Some(Network {
                     name: display_interface_name(name),
                     received_bytes_per_sec: previous
                         .and_then(|previous| counter_rate(previous.first, current.first, elapsed)),
@@ -475,7 +497,7 @@ impl Collector {
                     total_received_bytes: current.first,
                     total_transmitted_bytes: current.second,
                     is_up,
-                }
+                })
             })
             .collect::<Vec<_>>();
         if networks.is_empty() {
@@ -752,7 +774,7 @@ fn parse_networks(bytes: &[u8]) -> BTreeMap<OsString, Counters> {
             // Only ASCII whitespace is procfs padding. Unicode whitespace can
             // be part of a legal name and must survive the sysfs lookup.
             let name = line[..separator].trim_ascii();
-            if name.is_empty() || name == b"lo" {
+            if name.is_empty() {
                 return None;
             }
             let values = std::str::from_utf8(&line[separator + 1..]).ok()?;
@@ -1173,13 +1195,55 @@ mod tests {
     }
 
     #[test]
-    fn network_parser_separates_receive_transmit_and_omits_loopback() {
+    fn network_parser_separates_receive_transmit_and_keeps_names_for_classification() {
         let counters = parse_networks(
             b"Inter-| Receive | Transmit\n lo: 99 1 0 0 0 0 0 0 99 1 0 0 0 0 0 0\n eth0: 1024 2 0 0 0 0 0 0 2048 4 0 0 0 0 0 0\n bad: 1 2",
         );
-        assert_eq!(counters.len(), 1);
+        assert_eq!(counters.len(), 2);
+        assert_eq!(counters[OsStr::new("lo")].first, 99);
         assert_eq!(counters[OsStr::new("eth0")].first, 1024);
         assert_eq!(counters[OsStr::new("eth0")].second, 2048);
+    }
+
+    #[test]
+    fn network_loopback_exclusion_uses_flags_before_interface_names() {
+        let fixture = Fixture::new();
+        // Loopback can be renamed, and its old name can be assigned to a
+        // different link. Names alone cannot establish the interface type.
+        fixture.write("sys/class/net/local0/ifindex", "1");
+        fixture.write("sys/class/net/local0/flags", "0x9");
+        fixture.write("sys/class/net/lo/ifindex", "2");
+        fixture.write("sys/class/net/lo/flags", "0x1");
+        fixture.write(
+            "proc/net/dev",
+            "local0: 100 0 0 0 0 0 0 0 100 0 0 0 0 0 0 0\nlo: 200 0 0 0 0 0 0 0 300 0 0 0 0 0 0 0",
+        );
+        let mut collector = Collector::with_roots(fixture.0.join("proc"), fixture.0.join("sys"));
+        let mut warnings = Vec::new();
+        let sample = collector.sample_networks(&mut warnings);
+        assert_eq!(sample.len(), 1);
+        assert_eq!(sample[0].name, "lo");
+        assert_eq!(sample[0].total_received_bytes, 200);
+        assert_eq!(sample[0].total_transmitted_bytes, 300);
+        let steady = collector.sample_networks(&mut warnings);
+        assert_eq!(steady[0].received_bytes_per_sec, Some(0.0));
+        assert!(warnings.is_empty());
+
+        // The hardware type still identifies a renamed loopback if its flags
+        // are unreadable, while retaining an ordinary link named lo.
+        fs::remove_file(fixture.0.join("sys/class/net/local0/flags")).unwrap();
+        fixture.write("sys/class/net/local0/type", "772");
+        fs::remove_file(fixture.0.join("sys/class/net/lo/flags")).unwrap();
+        fixture.write("sys/class/net/lo/type", "1");
+        fixture.write("sys/class/net/lo/operstate", "up");
+        let sample = collector.sample_networks(&mut warnings);
+        assert_eq!(sample.len(), 1);
+        assert_eq!(sample[0].name, "lo");
+        assert!(warnings.is_empty());
+
+        // Preserve the conventional-name fallback if sysfs cannot identify it.
+        fs::remove_file(fixture.0.join("sys/class/net/lo/type")).unwrap();
+        assert!(collector.sample_networks(&mut warnings).is_empty());
     }
 
     #[test]
@@ -1394,6 +1458,31 @@ mod tests {
             collector.sample_disks(&mut warnings)[0].read_bytes_per_sec,
             Some(0.0)
         );
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn a_disk_counter_reset_invalidates_both_rates_and_recovers() {
+        let fixture = Fixture::new();
+        fixture.write("sys/block/sda/diskseq", "10");
+        let mut collector = Collector::with_roots(fixture.0.join("proc"), fixture.0.join("sys"));
+        let mut warnings = Vec::new();
+        for (read, written) in [(1000, 10), (100, 20), (200, 5)] {
+            // A reset can be visible in only one direction if the other has
+            // already accumulated more I/O than its previous lifetime total.
+            fixture.write(
+                "proc/diskstats",
+                &format!("8 0 sda 1 0 {read} 0 2 0 {written} 0 0 0 0"),
+            );
+            let sample = collector.sample_disks(&mut warnings);
+            assert_eq!(sample[0].total_read_bytes, read * 512);
+            assert_eq!(sample[0].total_write_bytes, written * 512);
+            assert_eq!(sample[0].read_bytes_per_sec, None);
+            assert_eq!(sample[0].write_bytes_per_sec, None);
+            let recovered = collector.sample_disks(&mut warnings);
+            assert_eq!(recovered[0].read_bytes_per_sec, Some(0.0));
+            assert_eq!(recovered[0].write_bytes_per_sec, Some(0.0));
+        }
         assert!(warnings.is_empty());
     }
 
@@ -1645,6 +1734,30 @@ mod tests {
         let steady = collector.sample_networks(&mut warnings);
         assert_eq!(steady[0].received_bytes_per_sec, Some(0.0));
         assert_eq!(steady[0].transmitted_bytes_per_sec, Some(0.0));
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn a_network_counter_reset_invalidates_both_rates_and_recovers() {
+        let fixture = Fixture::new();
+        fixture.write("sys/class/net/eth0/ifindex", "2");
+        fixture.write("sys/class/net/eth0/flags", "0x1");
+        let mut collector = Collector::with_roots(fixture.0.join("proc"), fixture.0.join("sys"));
+        let mut warnings = Vec::new();
+        for (received, transmitted) in [(1000, 10), (100, 20), (200, 5)] {
+            fixture.write(
+                "proc/net/dev",
+                &format!("eth0: {received} 0 0 0 0 0 0 0 {transmitted} 0 0 0 0 0 0 0"),
+            );
+            let sample = collector.sample_networks(&mut warnings);
+            assert_eq!(sample[0].total_received_bytes, received);
+            assert_eq!(sample[0].total_transmitted_bytes, transmitted);
+            assert_eq!(sample[0].received_bytes_per_sec, None);
+            assert_eq!(sample[0].transmitted_bytes_per_sec, None);
+            let recovered = collector.sample_networks(&mut warnings);
+            assert_eq!(recovered[0].received_bytes_per_sec, Some(0.0));
+            assert_eq!(recovered[0].transmitted_bytes_per_sec, Some(0.0));
+        }
         assert!(warnings.is_empty());
     }
 

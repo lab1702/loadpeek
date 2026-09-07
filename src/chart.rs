@@ -15,6 +15,8 @@ use crate::theme;
 pub struct Series {
     pub name: String,
     pub color: Color32,
+    /// Collection run, changed when history is reset even if the clock continues.
+    pub history_generation: u64,
     /// Monotonic timestamp at x = 0, shared by every series in this chart.
     pub time_origin: f64,
     /// Seconds relative to now, from -60 to 0. A non-finite y breaks the line.
@@ -24,6 +26,7 @@ pub struct Series {
 
 #[derive(Clone, Copy)]
 struct HistoryCursor {
+    generation: u64,
     selected_at: f64,
     latest_at: f64,
 }
@@ -266,13 +269,14 @@ fn inspect_history(
     times.dedup_by(|a, b| (*a - *b).abs() < 0.000_001);
     let last = times.len().saturating_sub(1);
     let time_origin = series.first().map_or(0.0, |series| series.time_origin);
+    let generation = series.first().map_or(0, |series| series.history_generation);
     let state_id = response.id.with("history_cursor");
     let cursor = ui.data(|data| data.get_temp::<HistoryCursor>(state_id));
     // Retain the observation, rather than its moving position in the deque.
     // An expired observation falls back to the nearest remaining boundary;
-    // a restarted monotonic timeline begins at its newest observation.
+    // a restarted history or monotonic timeline begins at its newest observation.
     let mut index = cursor
-        .filter(|cursor| time_origin >= cursor.latest_at)
+        .filter(|cursor| cursor.generation == generation && time_origin >= cursor.latest_at)
         .and_then(|cursor| {
             let seconds = cursor.selected_at - time_origin;
             times
@@ -357,6 +361,7 @@ fn inspect_history(
                 data.insert_temp(
                     state_id,
                     HistoryCursor {
+                        generation,
                         selected_at: time_origin + seconds,
                         latest_at: time_origin,
                     },
@@ -547,6 +552,7 @@ mod tests {
         Series {
             name: "Test".to_owned(),
             color: theme::BLUE,
+            history_generation: 0,
             time_origin: 0.0,
             points,
             dashed: false,
@@ -1011,5 +1017,47 @@ mod tests {
             inspection_frame(&ctx, &cpu_history_series(&history), None, false);
         assert_eq!(selected, Some(0.0));
         assert!(value.contains("Test: 2.0%"));
+    }
+
+    #[test]
+    fn inspection_resets_hidden_history_on_a_new_collection_generation() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let series = [Series {
+            time_origin: 20.0,
+            ..sample(vec![[-10.0, 12.0], [-5.0, 24.0], [0.0, 42.0]])
+        }];
+        inspection_frame(&ctx, &series, None, true);
+        inspection_frame(&ctx, &series, None, false);
+        let (selected, focused, _) = inspection_frame(&ctx, &series, Some(egui::Key::Home), false);
+        assert_eq!(selected, Some(-10.0));
+        assert!(focused);
+
+        // A chart on another page never observes the empty history at resume.
+        // The worker's monotonic clock continues across the new baseline.
+        let resumed = [Series {
+            history_generation: 1,
+            time_origin: 32.0,
+            ..sample(vec![[-2.0, f64::NAN], [-1.0, 50.0], [0.0, 55.0]])
+        }];
+        let (selected, focused, value) = inspection_frame(&ctx, &resumed, None, false);
+        assert_eq!(selected, Some(0.0));
+        assert!(focused);
+        assert!(value.contains("Test: 55.0%"));
+
+        // New navigation in this generation still retains its observation.
+        let (selected, _, _) = inspection_frame(&ctx, &resumed, Some(egui::Key::ArrowLeft), false);
+        assert_eq!(selected, Some(-1.0));
+        let advanced = [Series {
+            history_generation: 1,
+            time_origin: 33.0,
+            ..sample(vec![
+                [-3.0, f64::NAN],
+                [-2.0, 50.0],
+                [-1.0, 55.0],
+                [0.0, 60.0],
+            ])
+        }];
+        assert_eq!(inspection_frame(&ctx, &advanced, None, false).0, Some(-2.0));
     }
 }

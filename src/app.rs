@@ -243,6 +243,7 @@ impl Loadpeek {
             name: name.into(),
             color,
             dashed,
+            history_generation: self.generation,
             time_origin: self.history.latest_time(),
             points: self.history.series(select),
         }
@@ -2323,6 +2324,93 @@ mod tests {
         assert_eq!(next.0, selected.0);
         assert_eq!(next.1, 1.0);
         assert!(next.2.contains("CPU: 1.0%"));
+    }
+
+    #[test]
+    fn hidden_chart_starts_at_the_latest_observation_after_resume() {
+        use egui::accesskit::{Action, ActionData, ActionRequest, Role, TreeId};
+
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        crate::theme::apply(&ctx);
+        let (mut app, samples, _commands) = test_app();
+        app.page = Page::Cpu;
+        for at in [10.0, 11.0, 12.0] {
+            app.history.push(
+                at,
+                Snapshot {
+                    cpu_percent: Some(at),
+                    ..Snapshot::default()
+                },
+            );
+        }
+        let frame = |app: &mut Loadpeek, events| {
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1440.0, 1000.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.ui(ui, &mut eframe::Frame::_new_kittest()),
+            );
+            let cursor = output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .unwrap()
+                .nodes
+                .iter()
+                .find(|(_, node)| {
+                    node.role() == Role::Slider
+                        && node
+                            .label()
+                            .is_some_and(|name| name.starts_with("CPU, 60-second history"))
+                })
+                .map(|(id, node)| (*id, node.value().unwrap().to_owned()));
+            output.drop_without_applying_deltas();
+            cursor
+        };
+        let (id, _) = frame(&mut app, Vec::new()).unwrap();
+        let (_, selected) = frame(
+            &mut app,
+            vec![egui::Event::AccessKitActionRequest(ActionRequest {
+                action: Action::SetValue,
+                target_tree: TreeId::ROOT,
+                target_node: id,
+                data: Some(ActionData::NumericValue(0.0)),
+            })],
+        )
+        .unwrap();
+        assert!(selected.contains("CPU: 10.0%"), "{selected}");
+
+        // Resume on another page, so this chart never sees the empty history.
+        // The collector's elapsed clock continues across generation changes.
+        app.page = Page::Memory;
+        frame(&mut app, Vec::new());
+        app.toggle_pause();
+        app.toggle_pause();
+        for (at, cpu_percent) in [(20.0, None), (21.0, Some(61.0))] {
+            samples
+                .try_send(Sample {
+                    generation: app.generation,
+                    at,
+                    snapshot: Snapshot {
+                        cpu_percent,
+                        ..Snapshot::default()
+                    },
+                    processes: ProcessSnapshot::default(),
+                })
+                .unwrap();
+            tick_logic(&mut app, &ctx);
+            frame(&mut app, Vec::new());
+        }
+        app.page = Page::Cpu;
+        let (resumed_id, selected) = frame(&mut app, Vec::new()).unwrap();
+        assert_eq!(resumed_id, id);
+        assert!(selected.contains("CPU: 61.0%"), "{selected}");
     }
 
     #[test]
