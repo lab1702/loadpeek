@@ -86,6 +86,66 @@ struct Sample {
     processes: ProcessSnapshot,
 }
 
+#[derive(Clone, Copy)]
+struct SuspendReading {
+    before: Instant,
+    boot: Duration,
+    after: Instant,
+}
+
+impl SuspendReading {
+    fn now() -> Option<Self> {
+        let before = Instant::now();
+        let mut time = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: time is writable and clock_gettime retains no pointer.
+        let result = unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut time) };
+        let after = Instant::now();
+        if result != 0 || !(0..1_000_000_000).contains(&time.tv_nsec) {
+            return None;
+        }
+        Some(Self {
+            before,
+            boot: Duration::new(time.tv_sec.try_into().ok()?, time.tv_nsec as u32),
+            after,
+        })
+    }
+}
+
+#[derive(Default)]
+struct SuspendMonitor {
+    previous: Option<SuspendReading>,
+}
+
+impl SuspendMonitor {
+    fn resumed(&mut self, current: Option<SuspendReading>) -> bool {
+        let Some(current) = current else {
+            // Keep the last valid reading through a transient clock failure.
+            return false;
+        };
+        let Some(previous) = self.previous else {
+            self.previous = Some(current);
+            return false;
+        };
+        let Some(boot_elapsed) = current.boot.checked_sub(previous.boot) else {
+            self.previous = Some(current);
+            return false;
+        };
+        // Bracket the BOOTTIME reads with MONOTONIC Instants. Scheduling
+        // delays between clock reads cannot be mistaken for suspension.
+        let awake_elapsed = current.after.saturating_duration_since(previous.before);
+        let resumed = boot_elapsed.saturating_sub(awake_elapsed) > Duration::from_millis(1);
+        // Retain the tightest upper bound on BOOTTIME minus MONOTONIC. An
+        // unusually slow clock read must not hide a suspend on later ticks.
+        if resumed || boot_elapsed < current.before.saturating_duration_since(previous.before) {
+            self.previous = Some(current);
+        }
+        resumed
+    }
+}
+
 fn new_sampler() -> impl FnMut() -> (Snapshot, ProcessSnapshot) {
     let mut collector = Collector::new();
     let mut process_collector = ProcessCollector::new();
@@ -169,6 +229,7 @@ pub struct Loadpeek {
     core_filter: String,
     processes: ProcessSnapshot,
     process_view: ProcessView,
+    suspend_monitor: SuspendMonitor,
 }
 
 fn configure_context(ctx: &egui::Context, settings: &Settings) {
@@ -187,6 +248,10 @@ impl Loadpeek {
         let (commands, command_rx) = mpsc::channel();
         let ctx = cc.egui_ctx.clone();
         let interval = settings.refresh_secs;
+        // Establish the clock baseline before any samples can be queued.
+        let suspend_monitor = SuspendMonitor {
+            previous: SuspendReading::now(),
+        };
         thread::Builder::new()
             .name("loadpeek-collector".into())
             .spawn(move || {
@@ -211,26 +276,50 @@ impl Loadpeek {
             core_filter: String::new(),
             processes: ProcessSnapshot::default(),
             process_view: ProcessView::default(),
+            suspend_monitor,
         }
     }
 
     fn toggle_pause(&mut self) {
         self.paused = !self.paused;
         if !self.paused {
-            // In-flight collections can publish after this drain. Only samples
-            // from the worker's new baseline may enter the resumed history.
-            self.generation = self.generation.wrapping_add(1);
-            while self.samples.try_recv().is_ok() {}
-            self.history = History::default();
-            self.processes = ProcessSnapshot::default();
+            self.restart_collection();
+        } else {
+            let _ = self.commands.send(Command::Pause {
+                paused: true,
+                generation: self.generation,
+            });
         }
+    }
+    fn restart_collection(&mut self) {
+        // In-flight collections can publish after this drain. Only samples
+        // from the worker's new baseline may enter the resumed history.
+        self.generation = self.generation.wrapping_add(1);
+        while self.samples.try_recv().is_ok() {}
+        self.history = History::default();
+        self.processes = ProcessSnapshot::default();
         let _ = self.commands.send(Command::Pause {
-            paused: self.paused,
+            paused: false,
             generation: self.generation,
         });
     }
     fn persist(&mut self) {
         self.config_notice = self.settings.save().err();
+    }
+    fn collect_pending_samples(&mut self, clock: Option<SuspendReading>) {
+        if self.suspend_monitor.resumed(clock) && !self.paused {
+            // CLOCK_MONOTONIC stops during Linux suspend. Start a new history
+            // rather than displaying or interpolating across pre-sleep data.
+            self.restart_collection();
+        }
+        while let Ok(sample) = self.samples.try_recv() {
+            if !self.paused && sample.generation == self.generation {
+                self.history.push(sample.at, sample.snapshot);
+                // The process list is a current view, not a 60-second archive
+                // of thousands of command lines.
+                self.processes = sample.processes;
+            }
+        }
     }
     fn series(
         &self,
@@ -1177,14 +1266,7 @@ impl eframe::App for Loadpeek {
     fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // eframe calls logic even while the window is hidden, keeping the
         // bounded channel drained and the full history current when minimized.
-        while let Ok(sample) = self.samples.try_recv() {
-            if !self.paused && sample.generation == self.generation {
-                self.history.push(sample.at, sample.snapshot);
-                // The process list is a current view, not a 60-second archive
-                // of thousands of command lines.
-                self.processes = sample.processes;
-            }
-        }
+        self.collect_pending_samples(SuspendReading::now());
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
@@ -1610,6 +1692,7 @@ mod tests {
                 core_filter: String::new(),
                 processes: ProcessSnapshot::default(),
                 process_view: ProcessView::default(),
+                suspend_monitor: SuspendMonitor::default(),
             },
             sample_tx,
             command_rx,
@@ -1620,6 +1703,129 @@ mod tests {
         let _ = ctx.run_logic(&egui::RawInput::default(), |ctx| {
             app.logic(ctx, &mut eframe::Frame::_new_kittest());
         });
+    }
+
+    fn clock_reading(origin: Instant, before: f64, boot: f64, after: f64) -> SuspendReading {
+        SuspendReading {
+            before: origin + Duration::from_secs_f64(before),
+            boot: Duration::from_secs_f64(boot),
+            after: origin + Duration::from_secs_f64(after),
+        }
+    }
+
+    #[test]
+    fn suspend_detection_distinguishes_sleep_from_awake_delays_and_clock_failures() {
+        let origin = Instant::now();
+        let mut monitor = SuspendMonitor::default();
+        let mut observe =
+            |before, boot, after| monitor.resumed(Some(clock_reading(origin, before, boot, after)));
+        assert!(!observe(0.0, 1000.0, 0.0));
+        assert!(!observe(600.0, 1600.0, 600.0));
+        assert!(!observe(601.0, 1603.0, 604.0));
+        assert!(!observe(605.0, 1605.0, 605.0));
+        assert!(observe(606.0, 2206.0, 606.0));
+        assert!(!observe(607.0, 2207.0, 607.0));
+        assert!(!monitor.resumed(None));
+        assert!(monitor.resumed(Some(clock_reading(origin, 608.0, 2808.0, 608.0))));
+    }
+
+    #[test]
+    fn suspend_detection_survives_sleep_and_scheduling_delays_inside_clock_reads() {
+        let origin = Instant::now();
+        for before_boot_read in [false, true] {
+            let mut monitor = SuspendMonitor::default();
+            assert!(!monitor.resumed(Some(clock_reading(origin, 0.0, 1000.0, 0.0))));
+            let boot = if before_boot_read { 1011.0 } else { 1001.0 };
+            // Sleep for ten seconds during the bracket, followed by a long
+            // awake scheduling delay that can mask it in this one reading.
+            assert!(!monitor.resumed(Some(clock_reading(origin, 1.0, boot, 101.0))));
+            assert!(monitor.resumed(Some(clock_reading(origin, 102.0, 1112.0, 102.0))));
+            assert!(!monitor.resumed(Some(clock_reading(origin, 103.0, 1113.0, 103.0))));
+        }
+    }
+
+    #[test]
+    fn system_resume_clears_history_and_rejects_queued_and_late_samples() {
+        let (mut app, samples, commands) = test_app();
+        let origin = Instant::now();
+        let sample = |generation, at, cpu_percent| Sample {
+            generation,
+            at,
+            snapshot: Snapshot {
+                cpu_percent,
+                ..Snapshot::default()
+            },
+            processes: ProcessSnapshot {
+                warnings: vec![at.to_string()],
+                ..ProcessSnapshot::default()
+            },
+        };
+        app.disk = "sda".into();
+        app.network = "eth0".into();
+        samples.try_send(sample(0, 0.0, Some(99.0))).unwrap();
+        app.collect_pending_samples(Some(clock_reading(origin, 0.0, 1000.0, 0.0)));
+        samples.try_send(sample(0, 1.0, Some(90.0))).unwrap();
+        app.collect_pending_samples(Some(clock_reading(origin, 1.0, 1601.0, 1.0)));
+        assert_eq!(app.history.len(), 0);
+        assert!(app.processes.warnings.is_empty());
+        assert_eq!(app.generation, 1);
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(Command::Pause {
+                paused: false,
+                generation: 1
+            })
+        ));
+        assert_eq!((&*app.disk, &*app.network), ("sda", "eth0"));
+
+        samples.try_send(sample(0, 2.0, Some(80.0))).unwrap();
+        app.collect_pending_samples(Some(clock_reading(origin, 2.0, 1602.0, 2.0)));
+        assert_eq!(app.history.len(), 0);
+        samples.try_send(sample(1, 3.0, None)).unwrap();
+        samples.try_send(sample(1, 4.0, Some(5.0))).unwrap();
+        app.collect_pending_samples(Some(clock_reading(origin, 4.0, 1604.0, 4.0)));
+        assert_eq!(app.history.len(), 2);
+        let points = app.history.series(|s| s.cpu_percent);
+        assert!(points[0][1].is_nan());
+        assert_eq!(points[1], [0.0, 5.0]);
+        assert_eq!(app.processes.warnings, ["4"]);
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn system_resume_preserves_a_paused_display_until_explicit_resume() {
+        let (mut app, samples, commands) = test_app();
+        let origin = Instant::now();
+        samples
+            .try_send(Sample {
+                generation: 0,
+                at: 0.0,
+                snapshot: Snapshot::default(),
+                processes: ProcessSnapshot::default(),
+            })
+            .unwrap();
+        app.collect_pending_samples(Some(clock_reading(origin, 0.0, 1000.0, 0.0)));
+        app.toggle_pause();
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(Command::Pause { paused: true, .. })
+        ));
+        app.collect_pending_samples(Some(clock_reading(origin, 1.0, 1601.0, 1.0)));
+        assert!(app.paused);
+        assert_eq!(app.history.len(), 1);
+        assert_eq!(app.generation, 0);
+        assert!(commands.try_recv().is_err());
+        app.toggle_pause();
+        assert!(!app.paused);
+        assert_eq!(app.history.len(), 0);
+        assert_eq!(app.generation, 1);
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(Command::Pause {
+                paused: false,
+                generation: 1
+            })
+        ));
     }
 
     #[test]
@@ -1984,6 +2190,23 @@ mod tests {
 
     #[test]
     fn resume_rejects_inflight_samples_and_uses_fresh_collector() {
+        assert_restart_rejects_inflight_samples(false);
+    }
+
+    #[test]
+    fn system_resume_rejects_inflight_samples_and_uses_fresh_collector() {
+        assert_restart_rejects_inflight_samples(true);
+    }
+
+    fn simulate_system_resume(app: &mut Loadpeek) {
+        let origin = Instant::now();
+        app.suspend_monitor.previous = Some(clock_reading(origin, 0.0, 1000.0, 0.0));
+        app.collect_pending_samples(Some(clock_reading(origin, 1.0, 1601.0, 1.0)));
+        // Subsequent native logic ticks use the host's actual clock again.
+        app.suspend_monitor.previous = SuspendReading::now();
+    }
+
+    fn assert_restart_rejects_inflight_samples(system_resume: bool) {
         let (mut app, sample_tx, command_rx) = test_app();
         let ctx = egui::Context::default();
         let (started_tx, started_rx) = mpsc::channel();
@@ -2025,10 +2248,14 @@ mod tests {
             );
         });
 
-        // Pause and resume while the old collector is blocked inside sampling.
+        // Restart while the old collector is blocked inside sampling.
         assert_eq!(started_rx.recv_timeout(Duration::from_secs(5)).unwrap(), 0);
-        app.toggle_pause();
-        app.toggle_pause();
+        if system_resume {
+            simulate_system_resume(&mut app);
+        } else {
+            app.toggle_pause();
+            app.toggle_pause();
+        }
         release_tx.send(()).unwrap();
         ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         // Keep the fresh collector blocked until the old result is consumed.
@@ -2328,6 +2555,15 @@ mod tests {
 
     #[test]
     fn hidden_chart_starts_at_the_latest_observation_after_resume() {
+        assert_hidden_chart_resets_after_restart(false);
+    }
+
+    #[test]
+    fn hidden_chart_starts_at_the_latest_observation_after_system_resume() {
+        assert_hidden_chart_resets_after_restart(true);
+    }
+
+    fn assert_hidden_chart_resets_after_restart(system_resume: bool) {
         use egui::accesskit::{Action, ActionData, ActionRequest, Role, TreeId};
 
         let ctx = egui::Context::default();
@@ -2390,8 +2626,12 @@ mod tests {
         // The collector's elapsed clock continues across generation changes.
         app.page = Page::Memory;
         frame(&mut app, Vec::new());
-        app.toggle_pause();
-        app.toggle_pause();
+        if system_resume {
+            simulate_system_resume(&mut app);
+        } else {
+            app.toggle_pause();
+            app.toggle_pause();
+        }
         for (at, cpu_percent) in [(20.0, None), (21.0, Some(61.0))] {
             samples
                 .try_send(Sample {

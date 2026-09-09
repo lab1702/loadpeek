@@ -71,6 +71,8 @@ Chart inspection keeps the selected observation as new samples arrive and preser
 
 **Pause** freezes collection and the displayed history. **Resume** starts a fresh history and primes rate counters again. It also clears chart inspection selections from the previous history, including charts on other pages. Closing the application discards history.
 
+After system sleep, active collection likewise starts fresh history and rate baselines, clearing chart inspection selections so pre-sleep measurements cannot appear as recent activity. An explicitly paused display stays frozen until you choose **Resume**.
+
 Open **Settings & accessibility** to change interface size from **100% to 200%**, in 25% steps. The size control is keyboard-accessible through **Alt+S**; browser-style Ctrl+plus/minus/0 zoom shortcuts are disabled. Refresh interval and interface scale are saved automatically to:
 
 ```text
