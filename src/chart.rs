@@ -24,6 +24,175 @@ pub struct Series {
     pub dashed: bool,
 }
 
+/// Current readings ordered by frequency, with deterministic ties and no invented zeros.
+fn ranked_frequencies(cores: &[crate::metrics::Core]) -> Vec<(usize, f64)> {
+    let mut readings: Vec<_> = cores
+        .iter()
+        .filter_map(|core| {
+            core.frequency_mhz
+                .filter(|mhz| mhz.is_finite() && *mhz > 0.0)
+                .map(|mhz| (core.id, mhz))
+        })
+        .collect();
+    readings.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    readings
+}
+
+/// A rank plot is deliberately separate from the fixed 60-second history charts.
+pub fn show_core_frequencies(ui: &mut Ui, cores: &[crate::metrics::Core]) {
+    ui.push_id("cpu_frequency_distribution", |ui| {
+        let readings = ranked_frequencies(cores);
+        ui.label(
+            RichText::new(format!(
+                "{} of {} core frequencies available",
+                readings.len(),
+                cores.len()
+            ))
+            .small()
+            .color(theme::SUBTEXT),
+        );
+        let missing: Vec<_> = cores
+            .iter()
+            .filter(|core| {
+                !core
+                    .frequency_mhz
+                    .is_some_and(|mhz| mhz.is_finite() && mhz > 0.0)
+            })
+            .map(|core| core.id.to_string())
+            .collect();
+        if !missing.is_empty() {
+            ui.label(
+                RichText::new(format!("Unavailable cores: {}", missing.join(", ")))
+                    .small()
+                    .color(theme::SUBTEXT),
+            );
+        }
+        if readings.is_empty() {
+            ui.label("Core frequencies are unavailable.");
+            return;
+        }
+
+        let state_id = ui.id().with("rank");
+        let mut rank = ui
+            .data(|data| data.get_temp::<usize>(state_id))
+            .unwrap_or(1)
+            .clamp(1, readings.len());
+        let (rect, response) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width().max(100.0), 200.0),
+            Sense::hover(),
+        );
+        let painter = ui.painter();
+        let font = FontId::proportional(12.0);
+        let upper = nice_upper(readings[0].1 * 1.1);
+        let labels = [upper, upper / 2.0, 0.0].map(|mhz| format_value(mhz, "MHz"));
+        let axis_width = labels
+            .iter()
+            .map(|label| {
+                painter
+                    .layout_no_wrap(label.clone(), font.clone(), theme::SUBTEXT)
+                    .size()
+                    .x
+            })
+            .fold(28.0_f32, f32::max)
+            + 12.0;
+        let plot = Rect::from_min_max(
+            rect.min + egui::vec2(axis_width.min(rect.width() * 0.42), 8.0),
+            rect.max - egui::vec2(5.0, 28.0),
+        );
+        painter.rect_filled(plot.expand(5.0), 5.0, theme::BASE);
+        for (index, label) in labels.iter().enumerate() {
+            let y = egui::lerp(plot.top()..=plot.bottom(), index as f32 / 2.0);
+            painter.line_segment(
+                [egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)],
+                Stroke::new(1.0, theme::SURFACE1),
+            );
+            painter.text(
+                egui::pos2(plot.left() - 10.0, y),
+                Align2::RIGHT_CENTER,
+                label,
+                font.clone(),
+                theme::SUBTEXT,
+            );
+        }
+        let x = |index: usize| {
+            if readings.len() == 1 {
+                plot.center().x
+            } else {
+                egui::lerp(
+                    plot.left()..=plot.right(),
+                    index as f32 / (readings.len() - 1) as f32,
+                )
+            }
+        };
+        let points: Vec<_> = readings
+            .iter()
+            .enumerate()
+            .map(|(index, (_, mhz))| {
+                egui::pos2(
+                    x(index),
+                    plot.bottom() - (mhz / upper) as f32 * plot.height(),
+                )
+            })
+            .collect();
+        let clipped = painter.with_clip_rect(plot.expand(3.0).intersect(ui.clip_rect()));
+        draw_path(&clipped, &points, theme::LAVENDER, false);
+        for point in &points {
+            clipped.circle_filled(*point, 2.5, theme::LAVENDER);
+        }
+        if readings.len() == 1 {
+            painter.text(
+                egui::pos2(plot.center().x, plot.bottom() + 8.0),
+                Align2::CENTER_TOP,
+                "Rank 1",
+                font.clone(),
+                theme::SUBTEXT,
+            );
+        } else {
+            for (index, anchor) in [
+                (0, Align2::LEFT_TOP),
+                (readings.len() - 1, Align2::RIGHT_TOP),
+            ] {
+                painter.text(
+                    egui::pos2(x(index), plot.bottom() + 8.0),
+                    anchor,
+                    format!("Rank {}", index + 1),
+                    font.clone(),
+                    theme::SUBTEXT,
+                );
+            }
+        }
+        let detail = |index: usize| {
+            format!(
+                "Rank {} · Core {} · {}",
+                index + 1,
+                readings[index].0,
+                format_value(readings[index].1, "MHz")
+            )
+        };
+        if let Some(pointer) = response.hover_pos().filter(|pos| plot.contains(*pos)) {
+            let index = if readings.len() == 1 {
+                0
+            } else {
+                (((pointer.x - plot.left()) / plot.width()) * (readings.len() - 1) as f32).round()
+                    as usize
+            }
+            .min(readings.len() - 1);
+            clipped.circle_filled(points[index], 4.0, theme::TEXT);
+            response.on_hover_text(detail(index));
+        }
+        let selector =
+            ui.add(egui::Slider::new(&mut rank, 1..=readings.len()).text("Core frequency rank"));
+        if selector.gained_focus() {
+            selector.scroll_to_me(None);
+        }
+        ui.data_mut(|data| data.insert_temp(state_id, rank));
+        ui.painter()
+            .with_clip_rect(plot.expand(5.0).intersect(ui.clip_rect()))
+            .circle_stroke(points[rank - 1], 5.0, Stroke::new(1.5, theme::TEXT));
+        ui.label(detail(rank - 1));
+    });
+}
+
 #[derive(Clone, Copy)]
 struct HistoryCursor {
     generation: u64,
@@ -546,6 +715,91 @@ fn format_bytes(value: f64, per_second: bool) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn core_frequency_ranking_preserves_ids_and_excludes_invalid_readings() {
+        let cores: Vec<_> = [
+            (12, Some(800.0)),
+            (8, Some(3200.0)),
+            (2, Some(3200.0)),
+            (4, None),
+            (5, Some(f64::NAN)),
+            (6, Some(0.0)),
+            (7, Some(-100.0)),
+            (9, Some(f64::INFINITY)),
+        ]
+        .into_iter()
+        .map(|(id, frequency_mhz)| crate::metrics::Core {
+            id,
+            frequency_mhz,
+            percent: None,
+        })
+        .collect();
+        assert_eq!(
+            super::ranked_frequencies(&cores),
+            vec![(2, 3200.0), (8, 3200.0), (12, 800.0)]
+        );
+        assert!(super::ranked_frequencies(&cores[3..]).is_empty());
+    }
+
+    #[test]
+    fn core_frequency_plot_handles_empty_single_and_many_cores() {
+        for count in [0, 1, 256] {
+            let cores: Vec<_> = (0..count)
+                .map(|id| crate::metrics::Core {
+                    id: id * 2,
+                    frequency_mhz: Some(800.0 + id as f64 * 10.0),
+                    percent: None,
+                })
+                .collect();
+            for width in [240.0, 1200.0] {
+                let ctx = egui::Context::default();
+                ctx.enable_accesskit();
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            Pos2::ZERO,
+                            egui::vec2(width, 400.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| super::show_core_frequencies(ui, &cores),
+                );
+                output.textures_delta.clear();
+                let nodes = &output
+                    .platform_output
+                    .accesskit_update
+                    .as_ref()
+                    .unwrap()
+                    .nodes;
+                if count == 0 {
+                    assert!(
+                        nodes
+                            .iter()
+                            .any(|(_, node)| node.value()
+                                == Some("Core frequencies are unavailable."))
+                    );
+                } else {
+                    assert!(
+                        nodes
+                            .iter()
+                            .any(|(_, node)| node.role() == egui::accesskit::Role::Slider)
+                    );
+                    let expected = format!(
+                        "Rank 1 · Core {} · {}",
+                        (count - 1) * 2,
+                        super::format_value(800.0 + (count - 1) as f64 * 10.0, "MHz")
+                    );
+                    assert!(
+                        nodes
+                            .iter()
+                            .any(|(_, node)| node.value() == Some(expected.as_str()))
+                    );
+                }
+                output.drop_without_applying_deltas();
+            }
+        }
+    }
+
     use super::*;
 
     fn sample(points: Vec<[f64; 2]>) -> Series {

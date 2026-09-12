@@ -810,6 +810,20 @@ impl Loadpeek {
         });
         ui.add_space(18.0);
         card(ui, |ui| {
+            heading(ui, "Core frequency distribution", LAVENDER);
+            small(
+                ui,
+                "Current snapshot · highest frequency first · all logical cores",
+            );
+            small(
+                ui,
+                "Frequency spread is not a direct measure of utilization.",
+            );
+            ui.add_space(9.0);
+            chart::show_core_frequencies(ui, &s.cores);
+        });
+        ui.add_space(18.0);
+        card(ui, |ui| {
             heading(ui, "Load averages", YELLOW);
             ui.horizontal_wrapped(|ui| {
                 for (i, label) in ["1 minute", "5 minutes", "15 minutes"]

@@ -52,7 +52,7 @@ For runtime troubleshooting, Debian provides [libgl1](https://packages.debian.or
 | Page | What it shows |
 | --- | --- |
 | **Summary** | The first page: CPU utilization and minimum/average/maximum clock, RAM usage, disk read/write, network in/out, CPU temperature, load averages, and uptime. Each card opens its detail page. |
-| **CPU** | Overall utilization, minimum/average/maximum clock history, 1/5/15-minute load averages, and a utilization chart plus current clock for every online logical core. A core filter helps on large systems. |
+| **CPU** | Overall utilization, minimum/average/maximum clock history, a current core-frequency line chart sorted highest first, 1/5/15-minute load averages, and a utilization chart plus current clock for every online logical core. A core filter helps on large systems. |
 | **Memory** | RAM and swap utilization histories, total memory, available memory, used memory, and reclaimable cache. |
 | **Disk** | Combined or selected-device read/write history, current rates, and lifetime counters for detected whole block devices, with duplicate accounting layers excluded. |
 | **Network** | Combined or selected-interface incoming/outgoing history, current rates, interface state, and lifetime byte counters. |
@@ -65,7 +65,7 @@ Layouts reduce their column count as space narrows. Detail pages scroll when the
 
 Choose a refresh interval in the toolbar from **0.5 to 5.0 seconds**, in **0.5-second steps**. The default is one second. Collection runs outside the UI thread.
 
-Charts cover the last **60 real seconds**, independent of the chosen refresh rate. Collection and history updates continue while the window is minimized. History starts empty and fills as the application collects measurements; it is not loaded from before launch. CPU utilization and throughput need two valid readings, so their first sample has no rate. Missing readings and counter resets create gaps instead of zero-valued activity.
+History charts cover the last **60 real seconds**, independent of the chosen refresh rate. Collection and history updates continue while the window is minimized. History starts empty and fills as the application collects measurements; it is not loaded from before launch. CPU utilization and throughput need two valid readings, so their first sample has no rate. Missing readings and counter resets create gaps instead of zero-valued activity.
 
 Chart inspection keeps the selected observation as new samples arrive and preserves selection and keyboard focus when resizing rearranges the charts. When that observation expires, selection moves to the oldest remaining point.
 
@@ -114,7 +114,7 @@ CPU percentages use differences between `/proc/stat` samples. The overall value 
 
 Load averages are the kernel's 1-, 5-, and 15-minute averages of runnable or uninterruptible tasks, read from `/proc/loadavg`. They are task counts, not CPU percentages. Compare them with the number of logical cores, while remembering that I/O waits also contribute. Uptime comes from `/proc/uptime`.
 
-Clock readings prefer `cpuinfo_cur_freq`, then `scaling_cur_freq`, then `/proc/cpuinfo`'s `cpu MHz`. The CPU minimum, average, and maximum are calculated across cores with an available, finite, positive reading in each sample. Clock history tracks all three statistics for each sample. Individual core readouts show that core's current frequency. A scaling-driver reading may describe its requested frequency rather than the exact instantaneous hardware clock; availability and meaning depend on the driver. See [CPU performance scaling](https://docs.kernel.org/admin-guide/pm/cpufreq.html).
+Clock readings prefer `cpuinfo_cur_freq`, then `scaling_cur_freq`, then `/proc/cpuinfo`'s `cpu MHz`. The CPU minimum, average, and maximum are calculated across cores with an available, finite, positive reading in each sample. Clock history tracks all three statistics for each sample. The core-frequency distribution card plots every available current reading from highest to lowest, with rank on the horizontal axis. Hover a point or use the rank slider to identify its logical core and frequency. Unavailable cores are listed separately. This snapshot updates with collection and is independent of the core filter; frequency spread is not a direct measure of utilization. Individual core readouts show that core's current frequency. A scaling-driver reading may describe its requested frequency rather than the exact instantaneous hardware clock; availability and meaning depend on the driver. See [CPU performance scaling](https://docs.kernel.org/admin-guide/pm/cpufreq.html).
 
 ### Memory
 
